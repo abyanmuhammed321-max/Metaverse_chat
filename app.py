@@ -27,7 +27,9 @@ def init_db():
             username TEXT PRIMARY KEY,
             status TEXT,
             profile_pic TEXT,
-            theme TEXT
+            theme TEXT,
+            display_name TEXT,
+            google_sub TEXT
         )
     """)
     cursor.execute("""
@@ -99,6 +101,8 @@ class UserProfile(BaseModel):
     status: Optional[str] = None
     profile_pic: Optional[str] = None
     theme: Optional[str] = None
+    display_name: Optional[str] = None
+    google_sub: Optional[str] = None
 
 @app.post("/user/update")
 async def update_user(profile: UserProfile):
@@ -116,11 +120,11 @@ async def update_user(profile: UserProfile):
 
 @app.get("/user/{username}")
 async def get_user(username: str):
-    cursor.execute("SELECT status, profile_pic, theme FROM users WHERE username = ?", (username,))
+    cursor.execute("SELECT status, profile_pic, theme, display_name, google_sub FROM users WHERE username = ?", (username,))
     row = cursor.fetchone()
     if row:
-        return {"status": row[0], "profile_pic": row[1], "theme": row[2]}
-    return {"status": "Hey there! I am using Metaverse WhatsApp", "profile_pic": None, "theme": "dark"}
+        return {"status": row[0], "profile_pic": row[1], "theme": row[2], "display_name": row[3], "google_sub": row[4]}
+    return {"status": "Hey there! I am using Metaverse WhatsApp", "profile_pic": None, "theme": "dark", "display_name": username, "google_sub": None}
 
 class ContactAdd(BaseModel):
     username: str
@@ -181,6 +185,17 @@ async def get_history(user: str, contact: str):
     rows = cursor.fetchall()
     history = [{"id": r[0], "sender": r[1], "type": r[2], "content": r[3]} for r in rows]
     return {"history": history}
+
+class ClearChatRequest(BaseModel):
+    username: str
+    contact: str
+
+@app.post("/chat/clear")
+async def clear_chat(data: ClearChatRequest):
+    cursor.execute("DELETE FROM messages WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)", 
+                   (data.username, data.contact, data.contact, data.username))
+    db_conn.commit()
+    return {"status": "cleared", "count": cursor.rowcount}
 
 @app.websocket("/ws/{username}")
 async def websocket_endpoint(websocket: WebSocket, username: str):
@@ -382,9 +397,20 @@ HTML_CONTENT = """
             #app-container.mobile-chat-open .chat-panel { display: flex; }
             #backToContactsBtn { display: inline-block !important; }
         }
-    </style>
+    
+        .loading-overlay { position:fixed; inset:0; display:none; place-items:center; background:rgba(5,8,20,.65); z-index:9999; backdrop-filter:blur(4px); }
+        .loading-overlay.show { display:grid; }
+        .spinner { width:44px; height:44px; border:4px solid rgba(255,255,255,.15); border-top-color:#3b82f6; border-radius:50%; animation:spin .8s linear infinite; }
+        @keyframes spin { to { transform:rotate(360deg); } }
+        .context-menu { position:absolute; background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:6px 0; min-width:160px; box-shadow:0 8px 24px rgba(0,0,0,.35); z-index:500; display:none; }
+        .context-menu.show { display:block; }
+        .context-menu button { display:block; width:100%; padding:8px 14px; background:none; border:none; color:var(--text-main); text-align:left; cursor:pointer; font-size:13px; }
+        .context-menu button:hover { background:var(--bg-secondary); }
+</style>
 </head>
 <body class="theme-dark">
+    <div class="loading-overlay" id="loadingOverlay"><div class="spinner"></div></div>
+    <div class="context-menu" id="contextMenu"></div>
 
     <div id="app-container">
         <!-- Login Screen -->
@@ -401,8 +427,11 @@ HTML_CONTENT = """
                     </div>
                     <div class="g_id_signin" data-type="standard" data-shape="pill" data-theme="filled_black" data-size="large"></div>
                 </div>
-                <p class="auth-note" style="margin-top:12px;font-size:12px;color:var(--text-muted);">Sign in with Google to continue.</p>
+
+                <div class="divider">or quick manual access</div>
                 
+                <input type="text" id="loginUsernameInput" placeholder="Enter custom username..." onkeypress="handleLoginKey(event)">
+                <button class="manual-login" onclick="performManualLogin()">Initialize Session</button>
             </div>
         </div>
 
@@ -571,18 +600,6 @@ HTML_CONTENT = """
 
         const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
-        window.handleGoogleLogin = function(response) {
-            try {
-                const base64Url = response.credential.split('.')[1];
-                const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-                const jsonPayload = decodeURIComponent(atob(base64).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
-                const payload = JSON.parse(jsonPayload);
-                if (payload.email) initializeUserSession(payload.email);
-            } catch (err) {
-                alert("Google Sign-In verification error.");
-            }
-        }
-
         window.onload = async function() {
             if (currentUser) {
                 await fetchUserData(currentUser);
@@ -603,7 +620,26 @@ HTML_CONTENT = """
             }
         }
 
+        function handleGoogleLogin(response) {
+            try {
+                const base64Url = response.credential.split('.')[1];
+                const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+                const jsonPayload = decodeURIComponent(atob(base64).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+                const payload = JSON.parse(jsonPayload);
+                if (payload.email) initializeUserSession(payload.email);
+            } catch (err) {
+                alert("Google Sign-In verification error.");
+            }
+        }
 
+        function handleLoginKey(e) { if (e.key === "Enter") performManualLogin(); }
+
+        async function performManualLogin() {
+            const val = document.getElementById("loginUsernameInput").value.trim();
+            if (!val) { alert("Please enter a username."); return; }
+            await fetchUserData(val);
+            initializeUserSession(val);
+        }
 
         async function initializeUserSession(username) {
             currentUser = username;
