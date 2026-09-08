@@ -6,11 +6,11 @@ import sqlite3
 import uuid
 from typing import Dict, List, Optional
 
-app = FastAPI(title="Metaverse_WhatsApp - Ultimate Feature Edition")
+app = FastAPI(title="Metaverse_WhatsApp - Google Auth Edition")
 
 # ==================== DATABASE SETUP ====================
 def init_db():
-    conn = sqlite3.connect("metaverse_whatsapp_ultimate.db", check_same_thread=False)
+    conn = sqlite3.connect("metaverse_whatsapp_advanced.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
@@ -70,14 +70,6 @@ def init_db():
             question TEXT,
             options TEXT,
             votes TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS locked_chats (
-            username TEXT,
-            target TEXT,
-            secret_code TEXT,
-            PRIMARY KEY (username, target)
         )
     """)
     conn.commit()
@@ -226,8 +218,19 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
             content = message_data.get("message", "")
             is_group = message_data.get("is_group", False)
             
+            # Typing Indicator Relay
+            if msg_type == "typing":
+                payload = {"type": "typing", "sender_id": username, "is_group": is_group}
+                if is_group:
+                    cursor.execute("SELECT members FROM groups WHERE group_id = ?", (recipient_id,))
+                    row = cursor.fetchone()
+                    if row: await manager.broadcast_to_group(recipient_id, payload, json.loads(row[0]))
+                else:
+                    await manager.send_personal_message(payload, recipient_id)
+                continue
+
             # Handle WebRTC Signaling & Calls
-            if msg_type in ["call_request", "call_response", "offer", "answer", "ice_candidate", "end_call"]:
+            if msg_type in ["call_request", "call_response", "offer", "answer", "ice_candidate", "end_call", "toggle_video", "toggle_audio"]:
                 message_data["sender_id"] = username
                 await manager.send_personal_message(message_data, recipient_id)
                 continue
@@ -377,8 +380,9 @@ HTML_CONTENT = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Metaverse WhatsApp - Ultimate Feature Edition</title>
+    <title>Metaverse WhatsApp - Google Auth Edition</title>
     <link rel="icon" href="https://img.icons8.com/color/48/whatsapp--v1.png" type="image/png">
+    <!-- Google Identity Services SDK -->
     <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
         :root {
@@ -405,38 +409,25 @@ HTML_CONTENT = """
             --outgoing: #00a884;
         }
 
-        body.theme-dark {
-            --bg-primary: #080c14;
-            --bg-secondary: #111827;
-            --bg-panel: #1f2937;
-            --accent: #00f2fe;
-            --accent-gradient: linear-gradient(135deg, #00f2fe, #3b82f6);
-            --text-main: #f3f4f6;
-            --text-muted: #9ca3af;
-            --border: #374151;
-            --outgoing: #059669;
-        }
-
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
         body { background: var(--bg-primary); height: 100vh; display: flex; justify-content: center; align-items: center; color: var(--text-main); overflow: hidden; }
         .hidden { display: none !important; }
         
-        #app-container { width: 98%; max-width: 1500px; height: 95vh; background: var(--bg-secondary); border: 1px solid var(--border); display: flex; box-shadow: 0 0 40px rgba(0, 0, 0, 0.5); border-radius: 18px; overflow: hidden; position: relative; }
+        #app-container { width: 98%; max-width: 1550px; height: 96vh; background: var(--bg-secondary); border: 1px solid var(--border); display: flex; box-shadow: 0 0 40px rgba(0, 0, 0, 0.5); border-radius: 18px; overflow: hidden; position: relative; }
         
         #login-screen { position: absolute; inset: 0; background: var(--bg-primary); display: flex; justify-content: center; align-items: center; z-index: 200; padding: 15px; }
         #login-box { background: var(--bg-panel); border: 1px solid var(--border); padding: 40px 30px; border-radius: 20px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.3); width: 100%; max-width: 440px; }
         #login-box h1 { color: var(--accent); margin-bottom: 8px; font-size: 26px; font-weight: 700; }
         #login-box p { color: var(--text-muted); font-size: 13px; margin-bottom: 25px; }
         
-        .google-btn-wrapper { display: flex; justify-content: center; margin-bottom: 20px; }
-        .divider { display: flex; align-items: center; text-align: center; color: var(--text-muted); font-size: 12px; margin: 18px 0; }
+        #login-box input { width: 100%; padding: 12px 16px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; color: var(--text-main); font-size: 14px; outline: none; margin-bottom: 14px; text-align: center; }
+        #login-box input:focus { border-color: var(--accent); }
+        #login-box button.manual-login { width: 100%; padding: 12px; background: var(--accent-gradient); color: #fff; border: none; border-radius: 10px; font-weight: bold; font-size: 14px; cursor: pointer; transition: 0.2s; margin-bottom: 15px; }
+        
+        .divider { display: flex; align-items: center; text-align: center; color: var(--text-muted); font-size: 12px; margin: 15px 0; }
         .divider::before, .divider::after { content: ''; flex: 1; border-bottom: 1px solid var(--border); }
         .divider::before { margin-right: .5em; }
         .divider::after { margin-left: .5em; }
-
-        #login-box input { width: 100%; padding: 12px 16px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; color: var(--text-main); font-size: 14px; outline: none; margin-bottom: 14px; text-align: center; }
-        #login-box input:focus { border-color: var(--accent); }
-        #login-box button.manual-login { width: 100%; padding: 12px; background: var(--accent-gradient); color: #fff; border: none; border-radius: 10px; font-weight: bold; font-size: 14px; cursor: pointer; transition: 0.2s; }
 
         .sidebar { width: 35%; background: var(--bg-panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; height: 100%; }
         .sidebar-header { padding: 16px 20px; background: var(--bg-secondary); display: flex; align-items: center; justify-content: space-between; height: 75px; border-bottom: 1px solid var(--border); }
@@ -463,8 +454,8 @@ HTML_CONTENT = """
         .header-btn { background: var(--bg-panel); color: var(--text-main); border: 1px solid var(--border); padding: 7px 12px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 500; transition: 0.2s; white-space: nowrap; }
         .header-btn:hover { border-color: var(--accent); color: var(--accent); }
         
-        /* Pinned Banner */
         #pinned-banner { background: var(--bg-panel); border-bottom: 1px solid var(--border); padding: 8px 16px; font-size: 12px; display: flex; align-items: center; justify-content: space-between; color: var(--accent); }
+        #typing-indicator-bar { background: var(--bg-secondary); padding: 4px 20px; font-size: 11px; color: var(--accent); font-style: italic; }
 
         .chat-messages { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
         
@@ -494,13 +485,13 @@ HTML_CONTENT = """
 
         /* Call Modal */
         #call-modal { position: absolute; inset: 0; background: rgba(0,0,0,0.92); z-index: 400; display: flex; flex-direction: column; justify-content: center; align-items: center; }
-        .call-container { width: 90%; max-width: 800px; height: 75vh; background: var(--bg-panel); border-radius: 16px; border: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; position: relative; }
+        .call-container { width: 90%; max-width: 850px; height: 80vh; background: var(--bg-panel); border-radius: 16px; border: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; position: relative; }
         .call-videos { flex: 1; display: flex; background: #000; position: relative; justify-content: center; align-items: center; }
         #remoteVideo { width: 100%; height: 100%; object-fit: cover; }
-        #localVideo { width: 140px; height: 100px; position: absolute; bottom: 15px; right: 15px; border-radius: 8px; border: 2px solid var(--accent); object-fit: cover; background: #111; }
-        .call-controls { height: 75px; background: var(--bg-secondary); display: flex; justify-content: center; align-items: center; gap: 20px; }
+        .call-controls { height: 75px; background: var(--bg-secondary); display: flex; justify-content: center; align-items: center; gap: 16px; }
         .call-btn { padding: 10px 22px; border-radius: 50px; border: none; font-weight: bold; cursor: pointer; font-size: 14px; }
         .call-btn.end { background: #ef4444; color: white; }
+        .call-btn.control { background: var(--bg-panel); border: 1px solid var(--border); color: var(--text-main); }
 
         @media (max-width: 768px) {
             #app-container { width: 100%; height: 100vh; height: 100dvh; border-radius: 0; border: none; }
@@ -519,21 +510,26 @@ HTML_CONTENT = """
         <div id="login-screen">
             <div id="login-box">
                 <h1>⚡ Metaverse</h1>
-                <p>WhatsApp Ultimate Edition</p>
+                <p>Google Auth & Permanent Storage</p>
+                <input type="text" id="loginUsernameInput" placeholder="Enter username (e.g. alex@meta.com)" onkeypress="handleLoginKey(event)">
+                <button class="manual-login" onclick="performLogin()">Launch Secure Session</button>
                 
-                <div class="google-btn-wrapper">
-                    <div id="g_id_onload"
-                         data-client_id="358332042325-3s7o118sjfv1qug4r6qlmf534083ti10.apps.googleusercontent.com"
-                         data-callback="handleGoogleLogin"
-                         data-auto_select="true">
-                    </div>
-                    <div class="g_id_signin" data-type="standard" data-shape="pill" data-theme="filled_black" data-size="large"></div>
+                <div class="divider">or continue with</div>
+                
+                <!-- Google Sign In Button Container -->
+                <div id="g_id_onload"
+                     data-client_id="358332042325-3s7o118sjfv1qug4r6qlmf534083ti10.apps.googleusercontent.com"
+                     data-callback="handleGoogleCredentialResponse"
+                     data-auto_prompt="false">
                 </div>
-
-                <div class="divider">or quick manual access</div>
-                
-                <input type="text" id="loginUsernameInput" placeholder="Enter custom username..." onkeypress="handleLoginKey(event)">
-                <button class="manual-login" onclick="performManualLogin()">Initialize Session</button>
+                <div class="g_id_signin" 
+                     data-type="standard" 
+                     data-shape="rectangular" 
+                     data-theme="outline" 
+                     data-text="sign_in_with" 
+                     data-size="large" 
+                     data-width="380">
+                </div>
             </div>
         </div>
 
@@ -568,6 +564,7 @@ HTML_CONTENT = """
                     </div>
                 </div>
                 <div class="header-actions" id="chatHeaderActions">
+                    <input type="text" id="messageSearchInput" placeholder="Find in chat..." oninput="filterChatMessages()" style="padding: 6px 10px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; color: var(--text-main); font-size: 12px; width: 120px; outline: none;">
                     <button class="header-btn" onclick="openPollModal()" title="Create Poll">📊 Poll</button>
                     <button class="header-btn" onclick="startCall('voice')" title="Voice Call">📞</button>
                     <button class="header-btn" onclick="startCall('video')" title="Video Call">📹</button>
@@ -577,6 +574,7 @@ HTML_CONTENT = """
             <div id="pinned-banner" class="hidden">
                 <span>📌 Pinned Message: <strong id="pinnedBannerText">None</strong></span>
             </div>
+            <div id="typing-indicator-bar" class="hidden">...typing</div>
 
             <div class="chat-messages" id="chatMessagesContainer">
                 <div style="text-align: center; margin: auto; color: var(--text-muted); font-size: 13px;">
@@ -590,7 +588,7 @@ HTML_CONTENT = """
                 <label style="font-size: 11px; color: var(--text-muted); display: flex; align-items: center; gap: 3px; cursor: pointer;" title="View Once Mode">
                     <input type="checkbox" id="viewOnceCheckbox"> 1️⃣ View Once
                 </label>
-                <input type="text" id="messageInput" placeholder="Type a message..." onkeypress="handleKey(event)" disabled>
+                <input type="text" id="messageInput" placeholder="Type a message..." oninput="sendTypingSignal()" onkeypress="handleKey(event)" disabled>
                 <button class="action-btn" onclick="sendMessage()" style="color: var(--accent); font-size: 22px;" title="Send">➤</button>
             </div>
         </div>
@@ -667,9 +665,12 @@ HTML_CONTENT = """
                 </div>
                 <div class="call-videos">
                     <video id="remoteVideo" autoplay playsinline></video>
-                    <video id="video-local" autoplay playsinline muted style="width: 120px; height: 90px; position: absolute; bottom: 15px; right: 15px; border-radius: 8px; border: 2px solid var(--accent); object-fit: cover; background: #222;"></video>
+                    <video id="video-local" autoplay playsinline muted style="width: 130px; height: 95px; position: absolute; bottom: 15px; right: 15px; border-radius: 8px; border: 2px solid var(--accent); object-fit: cover; background: #222;"></video>
                 </div>
                 <div class="call-controls">
+                    <button class="call-btn control" onclick="toggleAudioMute()" id="muteAudioBtn">🎤 Mute</button>
+                    <button class="call-btn control" onclick="toggleVideoFeed()" id="toggleVideoBtn">📹 Stop Video</button>
+                    <button class="call-btn control" onclick="startScreenShare()" id="screenShareBtn">🖥️ Share Screen</button>
                     <button class="call-btn end" onclick="endCall()">End Call</button>
                 </div>
             </div>
@@ -690,6 +691,7 @@ HTML_CONTENT = """
         let isGroupActive = false;
         let chatHistories = {};
         let activePolls = {};
+        let typingTimeout = null;
 
         let mediaRecorder;
         let audioChunks = [];
@@ -703,6 +705,7 @@ HTML_CONTENT = """
 
         window.onload = async function() {
             if (currentUser) {
+                document.getElementById("loginUsernameInput").value = currentUser;
                 await fetchUserData(currentUser);
                 initializeUserSession(currentUser);
             }
@@ -713,28 +716,45 @@ HTML_CONTENT = """
                 const res = await fetch(`/user/${encodeURIComponent(username)}`);
                 const data = await res.json();
                 userStatus = data.status || userStatus;
-                userProfilePic = data.profile_pic || "";
+                userProfilePic = data.profile_pic || userProfilePic;
                 currentTheme = data.theme || "dark";
                 setTheme(currentTheme, false);
             } catch (err) { console.error(err); }
         }
 
-        function handleGoogleLogin(response) {
-            try {
-                const base64Url = response.credential.split('.')[1];
-                const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-                const payload = JSON.parse(decodeURIComponent(atob(base64).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('')));
-                if (payload.email) initializeUserSession(payload.email);
-            } catch (err) { alert("Google Sign-In error."); }
-        }
+        function handleLoginKey(e) { if (e.key === "Enter") performLogin(); }
 
-        function handleLoginKey(e) { if (e.key === "Enter") performManualLogin(); }
-
-        async function performManualLogin() {
+        async function performLogin() {
             const val = document.getElementById("loginUsernameInput").value.trim();
-            if (!val) { alert("Please enter a username."); return; }
+            if (!val) { alert("Please enter a username or sign in with Google."); return; }
             await fetchUserData(val);
             initializeUserSession(val);
+        }
+
+        // Handle Google Sign In Token Response
+        function decodeJwtResponse(token) {
+            let base64Url = token.split('.')[1];
+            let base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+            let jsonPayload = decodeURIComponent(atob(base64).split('').map(function(c) {
+                return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+            }).join(''));
+            return JSON.parse(jsonPayload);
+        }
+
+        async function handleGoogleCredentialResponse(response) {
+            const responsePayload = decodeJwtResponse(response.credential);
+            const googleEmail = responsePayload.email;
+            const googlePicture = responsePayload.picture;
+            const googleName = responsePayload.name;
+
+            if (googleEmail) {
+                currentUser = googleEmail;
+                if (googlePicture) userProfilePic = googlePicture;
+                if (googleName) userStatus = `Hi, I am ${googleName} using Metaverse WhatsApp`;
+                
+                await saveUserProfileToBackend();
+                initializeUserSession(currentUser);
+            }
         }
 
         async function initializeUserSession(username) {
@@ -822,6 +842,14 @@ HTML_CONTENT = """
                 if (data.type === "user_list") {
                     onlineUsers = data.users.filter(u => u !== currentUser);
                     renderContacts();
+                } else if (data.type === "typing") {
+                    if (data.sender_id === activeContact || (data.is_group && isGroupActive)) {
+                        const bar = document.getElementById("typing-indicator-bar");
+                        bar.innerText = `${data.sender_id} is typing...`;
+                        bar.classList.remove("hidden");
+                        clearTimeout(typingTimeout);
+                        typingTimeout = setTimeout(() => bar.classList.add("hidden"), 2000);
+                    }
                 } else if (data.type === "edit_message") {
                     const targetChat = data.is_group ? data.recipient_id : (data.sender_id === currentUser ? activeContact : data.sender_id);
                     if (chatHistories[targetChat]) {
@@ -830,7 +858,6 @@ HTML_CONTENT = """
                         if (activeContact === targetChat) renderMessages();
                     }
                 } else if (data.type === "reaction") {
-                    const targetChat = data.is_group ? activeContact : activeContact; // simplified sync
                     if (chatHistories[activeContact]) {
                         const m = chatHistories[activeContact].find(item => item.id === data.id);
                         if (m) m.reactions = data.reactions;
@@ -851,9 +878,9 @@ HTML_CONTENT = """
                     chatHistories[gId].push(data);
                     if (activeContact === gId) renderMessages();
                 } else if (data.type === "call_request") {
-                    alert(`Incoming ${data.call_type} call from ${data.sender_id}`);
                     activeCallPartner = data.sender_id;
                     currentCallType = data.call_type;
+                    document.getElementById("callPartnerLabel").innerText = `Incoming ${data.call_type} call from ${activeCallPartner}`;
                     document.getElementById("call-modal").classList.remove("hidden");
                     await setupWebRTCConnection(false);
                 } else if (data.type === "offer" || data.type === "answer" || data.type === "ice_candidate") {
@@ -877,6 +904,15 @@ HTML_CONTENT = """
                     renderContacts();
                 }
             };
+
+            ws.onclose = function() {
+                setTimeout(connectWebSocket, 3000);
+            };
+        }
+
+        function sendTypingSignal() {
+            if (!activeContact) return;
+            ws.send(JSON.stringify({ type: "typing", recipient_id: activeContact, is_group: isGroupActive }));
         }
 
         function renderContacts(filter = "") {
@@ -951,19 +987,22 @@ HTML_CONTENT = """
             document.getElementById("modalProfileName").innerText = activeContact;
             document.getElementById("modalProfileStatus").innerText = onlineUsers.includes(activeContact) ? "Online" : "Offline";
             document.getElementById("modalProfileAvatar").innerHTML = activeContact.charAt(0).toUpperCase();
+            
             const btnWrapper = document.getElementById("addToContactsBtnWrapper");
             if (savedContacts.includes(activeContact)) {
-                btnWrapper.innerHTML = `<p style="color: #10b981; font-weight: 600;">✓ In Contacts</p>`;
+                btnWrapper.innerHTML = `<p style="color: #10b981; font-weight: 600; margin-top: 15px;">✓ Saved in Contacts</p>`;
             } else {
-                btnWrapper.innerHTML = `<button class="sel-btn" style="width: 100%; background: var(--accent-gradient); color: white;" onclick="addCurrentContactPermanent()">➕ Add to Contacts</button>`;
+                btnWrapper.innerHTML = `<button class="sel-btn" style="width: 100%; background: var(--accent-gradient); color: white; margin-top: 15px;" onclick="addCurrentContactPermanent()">➕ Add to Contacts</button>`;
             }
             document.getElementById("contact-profile-modal").classList.remove("hidden");
         }
         function closeContactProfile() { document.getElementById("contact-profile-modal").classList.add("hidden"); }
 
         async function addCurrentContactPermanent() {
+            if (!activeContact || savedContacts.includes(activeContact)) return;
             await fetch("/contacts/add", {
-                method: "POST", headers: { "Content-Type": "application/json" },
+                method: "POST", 
+                headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ username: currentUser, contact: activeContact })
             });
             savedContacts.push(activeContact);
@@ -995,7 +1034,6 @@ HTML_CONTENT = """
             renderContacts();
         }
 
-        // Feature Actions: Edit, React, Pin, Polls, View Once
         function editMessage(msgId, currentText) {
             const newText = prompt("Edit message:", currentText);
             if (newText && newText !== currentText) {
@@ -1027,7 +1065,6 @@ HTML_CONTENT = """
             ws.send(JSON.stringify({ type: "poll_vote", recipient_id: activeContact, poll_id: pollId, option: option, is_group: isGroupActive }));
         }
 
-        // Multimedia & Call Functions
         async function toggleVoiceRecording() {
             const btn = document.getElementById("voiceRecordBtn");
             const viewOnce = document.getElementById("viewOnceCheckbox").checked;
@@ -1080,6 +1117,37 @@ HTML_CONTENT = """
             }
         }
 
+        function toggleAudioMute() {
+            if (!localStream) return;
+            const audioTrack = localStream.getAudioTracks()[0];
+            if (audioTrack) {
+                audioTrack.enabled = !audioTrack.enabled;
+                document.getElementById("muteAudioBtn").innerText = audioTrack.enabled ? "🎤 Mute" : "🎤 Unmute";
+            }
+        }
+
+        function toggleVideoFeed() {
+            if (!localStream) return;
+            const videoTrack = localStream.getVideoTracks()[0];
+            if (videoTrack) {
+                videoTrack.enabled = !videoTrack.enabled;
+                document.getElementById("toggleVideoBtn").innerText = videoTrack.enabled ? "📹 Stop Video" : "📹 Start Video";
+            }
+        }
+
+        async function startScreenShare() {
+            try {
+                const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+                const screenTrack = screenStream.getVideoTracks()[0];
+                const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
+                if (sender) sender.replaceTrack(screenTrack);
+                screenTrack.onended = () => {
+                    const cameraTrack = localStream.getVideoTracks()[0];
+                    if (sender && cameraTrack) sender.replaceTrack(cameraTrack);
+                };
+            } catch (err) { console.error("Screen share error:", err); }
+        }
+
         function endCall() {
             if (activeCallPartner) ws.send(JSON.stringify({ type: "end_call", recipient_id: activeCallPartner }));
             closeCallModals();
@@ -1092,14 +1160,20 @@ HTML_CONTENT = """
             activeCallPartner = null;
         }
 
+        function filterChatMessages() {
+            renderMessages();
+        }
+
         function renderMessages() {
             const container = document.getElementById("chatMessagesContainer");
             container.innerHTML = "";
             const messages = chatHistories[activeContact] || [];
+            const filterQuery = document.getElementById("messageSearchInput").value.toLowerCase();
             
             let pinnedText = null;
 
             messages.forEach(msg => {
+                if (filterQuery && !msg.content.toLowerCase().includes(filterQuery)) return;
                 if (msg.is_pinned) pinnedText = msg.content;
                 const isOutgoing = msg.sender === "You" || msg.sender === currentUser;
                 let contentHTML = "";
@@ -1126,11 +1200,13 @@ HTML_CONTENT = """
                         <button class="msg-action-btn" onclick="sendReaction(${msg.id}, '❤️')">❤️</button>
                         <button class="msg-action-btn" onclick="togglePin(${msg.id}, ${msg.is_pinned})">📌</button>
                         ${isOutgoing && msg.type === 'chat' ? `<button class="msg-action-btn" onclick="editMessage(${msg.id}, '${msg.content}')">✏️</button>` : ''}
+                        <span style="margin-left: auto; font-size: 10px; opacity: 0.8;">✓✓</span>
                     </div>
                 `;
 
                 container.innerHTML += `
                     <div class="message ${isOutgoing ? "outgoing" : "incoming"}">
+                        ${isGroupActive && !isOutgoing ? `<span style="font-size:11px; font-weight:bold; color:var(--accent);">${msg.sender}</span>` : ''}
                         <div>${contentHTML}</div>
                         ${reactionsHTML}
                         ${actionsRow}
@@ -1172,7 +1248,7 @@ HTML_CONTENT = """
 
         function sendMessage() {
             const input = document.getElementById("messageInput");
-            const text = input.value.trim();
+            const text = input.value.temp || input.value.trim();
             const viewOnce = document.getElementById("viewOnceCheckbox").checked;
             if (!text || !activeContact) return;
 
