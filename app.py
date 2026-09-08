@@ -4,9 +4,10 @@ from pydantic import BaseModel
 import json
 import sqlite3
 import uuid
+import urllib.request
 from typing import Dict, List, Optional
 
-app = FastAPI(title="Metaverse_WhatsApp - Permanent Storage Edition")
+app = FastAPI(title="Metaverse_WhatsApp - Google Auth Edition")
 
 # ==================== DATABASE SETUP ====================
 def init_db():
@@ -31,7 +32,9 @@ def init_db():
             username TEXT PRIMARY KEY,
             status TEXT,
             profile_pic TEXT,
-            theme TEXT
+            theme TEXT,
+            is_google INTEGER DEFAULT 0,
+            google_name TEXT
         )
     """)
     cursor.execute("""
@@ -117,6 +120,36 @@ class UserProfile(BaseModel):
     profile_pic: Optional[str] = None
     theme: Optional[str] = None
 
+class GoogleAuthModel(BaseModel):
+    id_token: str
+
+@app.post("/auth/google")
+async def google_auth(data: GoogleAuthModel):
+    try:
+        url = f"https://oauth2.googleapis.com/tokeninfo?id_token={data.id_token}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req) as response:
+            res_data = json.loads(response.read().decode())
+            email = res_data.get("email")
+            name = res_data.get("name", email)
+            picture = res_data.get("picture", "")
+            
+            if not email:
+                return {"status": "error", "message": "Invalid Google Token"}
+            
+            cursor.execute("""
+                INSERT INTO users (username, status, profile_pic, theme, is_google, google_name) 
+                VALUES (?, ?, ?, ?, 1, ?)
+                ON CONFLICT(username) DO UPDATE SET 
+                    profile_pic = COALESCE(?, profile_pic),
+                    is_google = 1,
+                    google_name = ?
+            """, (email, "Hey there! I am using Metaverse WhatsApp", picture, "dark", name, picture, name))
+            db_conn.commit()
+            return {"status": "success", "username": email, "profile_pic": picture, "name": name}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.post("/user/update")
 async def update_user(profile: UserProfile):
     cursor.execute("""
@@ -133,11 +166,17 @@ async def update_user(profile: UserProfile):
 
 @app.get("/user/{username}")
 async def get_user(username: str):
-    cursor.execute("SELECT status, profile_pic, theme FROM users WHERE username = ?", (username,))
+    cursor.execute("SELECT status, profile_pic, theme, is_google, google_name FROM users WHERE username = ?", (username,))
     row = cursor.fetchone()
     if row:
-        return {"status": row[0], "profile_pic": row[1], "theme": row[2]}
-    return {"status": "Hey there! I am using Metaverse WhatsApp", "profile_pic": None, "theme": "dark"}
+        return {
+            "status": row[0],
+            "profile_pic": row[1],
+            "theme": row[2],
+            "is_google": row[3],
+            "google_name": row[4]
+        }
+    return {"status": "Hey there! I am using Metaverse WhatsApp", "profile_pic": None, "theme": "dark", "is_google": 0, "google_name": None}
 
 class ContactAdd(BaseModel):
     username: str
@@ -366,9 +405,10 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     "id": msg_id, "type": msg_type, "sender_id": username, "message": content,
                     "view_once": view_once, "is_edited": 0, "is_pinned": 0, "reactions": {}
                 }
-                # Send to recipient AND back to sender so it appears on screen immediately
+                # Send to recipient and also explicitly back to the sender so message appears immediately!
                 await manager.send_personal_message(payload, recipient_id)
-                await manager.send_personal_message(payload, username)
+                if recipient_id != username:
+                    await manager.send_personal_message(payload, username)
                 
     except WebSocketDisconnect:
         manager.disconnect(username)
@@ -382,7 +422,7 @@ HTML_CONTENT = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Metaverse WhatsApp - Permanent Storage & Google Sign-In</title>
+    <title>Metaverse WhatsApp - Google Auth Edition</title>
     <link rel="icon" href="https://img.icons8.com/color/48/whatsapp--v1.png" type="image/png">
     <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
@@ -424,11 +464,9 @@ HTML_CONTENT = """
         #login-box input { width: 100%; padding: 12px 16px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; color: var(--text-main); font-size: 14px; outline: none; margin-bottom: 14px; text-align: center; }
         #login-box input:focus { border-color: var(--accent); }
         #login-box button.manual-login { width: 100%; padding: 12px; background: var(--accent-gradient); color: #fff; border: none; border-radius: 10px; font-weight: bold; font-size: 14px; cursor: pointer; transition: 0.2s; margin-bottom: 15px; }
-
-        .divider { display: flex; align-items: center; text-align: center; color: var(--text-muted); font-size: 12px; margin: 15px 0; }
-        .divider::before, .divider::after { content: ''; flex: 1; border-bottom: 1px solid var(--border); }
-        .divider::before { margin-right: .75em; }
-        .divider::after { margin-left: .75em; }
+        
+        .divider-text { color: var(--text-muted); font-size: 12px; margin: 15px 0; display: flex; align-items: center; justify-content: center; gap: 10px; }
+        .divider-text::before, .divider-text::after { content: ""; flex: 1; height: 1px; background: var(--border); }
 
         .sidebar { width: 35%; background: var(--bg-panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; height: 100%; }
         .sidebar-header { padding: 16px 20px; background: var(--bg-secondary); display: flex; align-items: center; justify-content: space-between; height: 75px; border-bottom: 1px solid var(--border); }
@@ -444,8 +482,9 @@ HTML_CONTENT = """
         .contacts-list { flex: 1; overflow-y: auto; }
         .contact-item { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border); cursor: pointer; transition: 0.2s; position: relative; }
         .contact-item:hover, .contact-item.active { background: var(--bg-secondary); border-left: 4px solid var(--accent); }
-        .contact-details h4 { font-size: 15px; color: var(--text-main); font-weight: 500; }
+        .contact-details h4 { font-size: 15px; color: var(--text-main); font-weight: 500; display: flex; align-items: center; gap: 6px; }
         .contact-details p { font-size: 12px; color: var(--accent); margin-top: 3px; }
+        .google-verified-badge { background: #4285F4; color: white; font-size: 9px; padding: 2px 5px; border-radius: 4px; font-weight: bold; }
 
         .chat-panel { flex: 1; display: flex; flex-direction: column; background: var(--bg-primary); position: relative; height: 100%; }
         .chat-header { height: 75px; background: var(--bg-secondary); padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); }
@@ -484,6 +523,7 @@ HTML_CONTENT = """
         .sel-btn { background: var(--bg-secondary); border: 1px solid var(--border); color: var(--text-main); padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13px; transition: 0.2s; }
         .sel-btn:hover { border-color: var(--accent); color: var(--accent); }
 
+        /* Call Modal */
         #call-modal { position: absolute; inset: 0; background: rgba(0,0,0,0.92); z-index: 400; display: flex; flex-direction: column; justify-content: center; align-items: center; }
         .call-container { width: 90%; max-width: 850px; height: 80vh; background: var(--bg-panel); border-radius: 16px; border: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; position: relative; }
         .call-videos { flex: 1; display: flex; background: #000; position: relative; justify-content: center; align-items: center; }
@@ -510,20 +550,26 @@ HTML_CONTENT = """
         <div id="login-screen">
             <div id="login-box">
                 <h1>⚡ Metaverse</h1>
-                <p>Permanent Storage & Google Sign-In</p>
+                <p>Google Auth Edition</p>
+                <input type="text" id="loginUsernameInput" placeholder="Enter username (e.g. alex@meta.com)" onkeypress="handleLoginKey(event)">
+                <button class="manual-login" onclick="performLogin()">Launch Session</button>
                 
-                <!-- Google Sign-In Button -->
+                <div class="divider-text">OR SIGN IN WITH GOOGLE</div>
+                <!-- Google Sign-In Button Container -->
                 <div id="g_id_onload"
                      data-client_id="358332042325-3s7o118sjfv1qug4r6qlmf534083ti10.apps.googleusercontent.com"
-                     data-callback="handleGoogleLogin"
+                     data-callback="handleGoogleCredentialResponse"
                      data-auto_prompt="false">
                 </div>
-                <div class="g_id_signin" data-type="standard" data-shape="rectangular" data-theme="outline" data-text="sign_in_with" data-size="large" data-logo_alignment="left" style="display: flex; justify-content: center; margin-bottom: 10px;"></div>
-
-                <div class="divider">or manual login</div>
-
-                <input type="text" id="loginUsernameInput" placeholder="Enter username (e.g. alex@meta.com)" onkeypress="handleLoginKey(event)">
-                <button class="manual-login" onclick="performManualLogin()">Launch Secure Session</button>
+                <div class="g_id_signin"
+                     data-type="standard"
+                     data-shape="rectangular"
+                     data-theme="filled_black"
+                     data-text="sign_in_with"
+                     data-size="large"
+                     data-logo_alignment="left"
+                     style="display: flex; justify-content: center; width: 100%;">
+                </div>
             </div>
         </div>
 
@@ -629,7 +675,8 @@ HTML_CONTENT = """
             <div class="modal-content" style="text-align: center;">
                 <div class="contact-avatar" id="modalProfileAvatar" style="width: 80px; height: 80px; font-size: 32px; margin: 0 auto 15px auto;">?</div>
                 <h3 id="modalProfileName" style="margin-bottom: 5px;">Contact Name</h3>
-                <p id="modalProfileStatus" style="color: var(--text-muted); font-size: 13px; margin-bottom: 20px;">Status...</p>
+                <p id="modalProfileStatus" style="color: var(--text-muted); font-size: 13px; margin-bottom: 10px;">Status...</p>
+                <div id="googleProfileBadgeInfo" style="margin-bottom: 15px;"></div>
                 <div id="addToContactsBtnWrapper"></div>
                 <button class="sel-btn" style="width: 100%; margin-top: 10px;" onclick="closeContactProfile()">Close</button>
             </div>
@@ -681,6 +728,7 @@ HTML_CONTENT = """
         let onlineUsers = [];
         let savedContacts = [];
         let userGroups = [];
+        let userCacheDetails = {};
         let activeContact = null;
         let isGroupActive = false;
         let chatHistories = {};
@@ -699,47 +747,56 @@ HTML_CONTENT = """
 
         window.onload = async function() {
             if (currentUser) {
+                document.getElementById("loginUsernameInput").value = currentUser;
                 await fetchUserData(currentUser);
                 initializeUserSession(currentUser);
             }
         };
-
-        function decodeJwtResponse(token) {
-            let base64Url = token.split('.')[1];
-            let base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-            let jsonPayload = decodeURIComponent(window.atob(base64).split('').map(c => '%' + ('0' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
-            return JSON.parse(jsonPayload);
-        }
-
-        async function handleGoogleLogin(response) {
-            const responsePayload = decodeJwtResponse(response.credential);
-            const email = responsePayload.email;
-            const picture = responsePayload.picture;
-            
-            userProfilePic = picture || "";
-            await fetchUserData(email);
-            if (!userProfilePic && picture) userProfilePic = picture;
-            await initializeUserSession(email);
-        }
 
         async function fetchUserData(username) {
             try {
                 const res = await fetch(`/user/${encodeURIComponent(username)}`);
                 const data = await res.json();
                 userStatus = data.status || userStatus;
-                userProfilePic = data.profile_pic || userProfilePic;
+                userProfilePic = data.profile_pic || "";
                 currentTheme = data.theme || "dark";
                 setTheme(currentTheme, false);
             } catch (err) { console.error(err); }
         }
 
-        function handleLoginKey(e) { if (e.key === "Enter") performManualLogin(); }
+        async function fetchUserDetailsForContact(username) {
+            try {
+                const res = await fetch(`/user/${encodeURIComponent(username)}`);
+                const data = await res.json();
+                userCacheDetails[username] = data;
+                return data;
+            } catch (err) { return null; }
+        }
 
-        async function performManualLogin() {
+        function handleLoginKey(e) { if (e.key === "Enter") performLogin(); }
+
+        async function performLogin() {
             const val = document.getElementById("loginUsernameInput").value.trim();
-            if (!val) { alert("Please enter a username or use Google Sign-In."); return; }
+            if (!val) { alert("Please enter a username."); return; }
             await fetchUserData(val);
             initializeUserSession(val);
+        }
+
+        async function handleGoogleCredentialResponse(response) {
+            try {
+                const res = await fetch("/auth/google", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ id_token: response.credential })
+                });
+                const data = await res.json();
+                if (data.status === "success") {
+                    userProfilePic = data.profile_pic;
+                    initializeUserSession(data.username);
+                } else {
+                    alert("Google Sign-In failed: " + data.message);
+                }
+            } catch (err) { console.error(err); alert("Google Auth error."); }
         }
 
         async function initializeUserSession(username) {
@@ -748,7 +805,6 @@ HTML_CONTENT = """
             document.getElementById("my-profile-display").innerText = currentUser;
             if (userProfilePic) document.getElementById("myAvatarDisplay").innerHTML = `<img src="${userProfilePic}">`;
             document.getElementById("login-screen").classList.add("hidden");
-            await saveUserProfileToBackend();
             connectWebSocket();
             await fetchSavedContacts();
             await fetchUserGroups();
@@ -831,7 +887,7 @@ HTML_CONTENT = """
                 } else if (data.type === "typing") {
                     if (data.sender_id === activeContact || (data.is_group && isGroupActive)) {
                         const bar = document.getElementById("typing-indicator-bar");
-                        bar.innerText = `${data.sender_id} is typing...`;
+                        bar.innerText = data.is_group ? `${data.sender_id} is typing...` : `${data.sender_id} is typing...`;
                         bar.classList.remove("hidden");
                         clearTimeout(typingTimeout);
                         typingTimeout = setTimeout(() => bar.classList.add("hidden"), 2000);
@@ -861,9 +917,7 @@ HTML_CONTENT = """
                 } else if (data.is_group) {
                     const gId = data.group_id;
                     if (!chatHistories[gId]) chatHistories[gId] = [];
-                    if (!chatHistories[gId].some(m => m.id === data.id)) {
-                        chatHistories[gId].push(data);
-                    }
+                    chatHistories[gId].push(data);
                     if (activeContact === gId) renderMessages();
                 } else if (data.type === "call_request") {
                     activeCallPartner = data.sender_id;
@@ -885,11 +939,9 @@ HTML_CONTENT = """
                 } else if (data.type === "end_call") {
                     closeCallModals();
                 } else {
-                    const sender = data.sender_id === currentUser ? activeContact : data.sender_id;
+                    const sender = data.sender_id === currentUser ? activeContact : (data.sender_id || activeContact);
                     if (!chatHistories[sender]) chatHistories[sender] = [];
-                    if (!chatHistories[sender].some(m => m.id === data.id)) {
-                        chatHistories[sender].push(data);
-                    }
+                    chatHistories[sender].push(data);
                     if (activeContact === sender) renderMessages();
                     renderContacts();
                 }
@@ -905,7 +957,7 @@ HTML_CONTENT = """
             ws.send(JSON.stringify({ type: "typing", recipient_id: activeContact, is_group: isGroupActive }));
         }
 
-        function renderContacts(filter = "") {
+        async function renderContacts(filter = "") {
             const container = document.getElementById("contactsListContainer");
             container.innerHTML = "";
             userGroups.forEach(grp => {
@@ -919,17 +971,37 @@ HTML_CONTENT = """
                 `;
             });
             const allSet = new Set([...onlineUsers, ...savedContacts]);
-            allSet.forEach(email => {
-                if (email === currentUser || !email.toLowerCase().includes(filter.toLowerCase())) return;
+            for (let email of allSet) {
+                if (email === currentUser || !email.toLowerCase().includes(filter.toLowerCase())) continue;
                 const isOnline = onlineUsers.includes(email);
                 const isActive = activeContact === email ? "active" : "";
+                
+                // Fetch details for Google profile display
+                let details = userCacheDetails[email];
+                if (!details) {
+                    details = await fetchUserDetailsForContact(email);
+                }
+                
+                let avatarHtml = email.charAt(0).toUpperCase();
+                let displayName = email;
+                let googleBadge = "";
+                
+                if (details && details.is_google) {
+                    if (details.profile_pic) avatarHtml = `<img src="${details.profile_pic}">`;
+                    if (details.google_name) displayName = details.google_name;
+                    googleBadge = `<span class="google-verified-badge">Google</span>`;
+                }
+
                 container.innerHTML += `
                     <div class="contact-item ${isActive}" onclick="selectContact('${email}')">
-                        <div class="contact-avatar">${email.charAt(0).toUpperCase()}<div class="${isOnline ? 'online-dot' : 'offline-dot'}"></div></div>
-                        <div class="contact-details"><h4>${email}</h4><p>${isOnline ? 'Online' : 'Offline'}</p></div>
+                        <div class="contact-avatar">${avatarHtml}<div class="${isOnline ? 'online-dot' : 'offline-dot'}"></div></div>
+                        <div class="contact-details">
+                            <h4>${displayName} ${googleBadge}</h4>
+                            <p>${isOnline ? 'Online' : 'Offline'}</p>
+                        </div>
                     </div>
                 `;
-            });
+            }
         }
 
         function filterContacts() { renderContacts(document.getElementById("searchContactInput").value); }
@@ -937,16 +1009,25 @@ HTML_CONTENT = """
         async function selectContact(email) {
             activeContact = email;
             isGroupActive = false;
-            document.getElementById("activeChatTitle").innerText = email;
+            
+            let details = userCacheDetails[email] || await fetchUserDetailsForContact(email);
+            let headerTitle = email;
+            let headerAvatar = email.charAt(0).toUpperCase();
+            if (details && details.is_google) {
+                if (details.google_name) headerTitle = details.google_name;
+                if (details.profile_pic) headerAvatar = `<img src="${details.profile_pic}">`;
+            }
+
+            document.getElementById("activeChatTitle").innerText = headerTitle;
             document.getElementById("activeChatStatus").innerText = onlineUsers.includes(email) ? "Online" : "Offline";
-            document.getElementById("activeChatAvatar").innerHTML = email.charAt(0).toUpperCase();
+            document.getElementById("activeChatAvatar").innerHTML = headerAvatar;
             document.getElementById("messageInput").disabled = false;
             document.getElementById("app-container").classList.add("mobile-chat-open");
             
             await fetchPollsForChat(email);
             const res = await fetch(`/history/${encodeURIComponent(currentUser)}/${encodeURIComponent(email)}`);
             const data = await res.json();
-            chatHistories[email] = data.history.map(m => ({ ...m, sender: m.sender }));
+            chatHistories[email] = data.history.map(m => ({ ...m, sender: m.sender === currentUser ? "You" : m.sender }));
             renderMessages();
         }
 
@@ -962,7 +1043,7 @@ HTML_CONTENT = """
             await fetchPollsForChat(groupId);
             const res = await fetch(`/group-history/${groupId}`);
             const data = await res.json();
-            chatHistories[groupId] = data.history.map(m => ({ ...m, sender: m.sender }));
+            chatHistories[groupId] = data.history.map(m => ({ ...m, sender: m.sender === currentUser ? "You" : m.sender }));
             renderMessages();
         }
 
@@ -972,11 +1053,24 @@ HTML_CONTENT = """
             activeContact = null;
         }
 
-        function openContactProfile() {
+        async function openContactProfile() {
             if (!activeContact || isGroupActive) return;
-            document.getElementById("modalProfileName").innerText = activeContact;
-            document.getElementById("modalProfileStatus").innerText = onlineUsers.includes(activeContact) ? "Online" : "Offline";
-            document.getElementById("modalProfileAvatar").innerHTML = activeContact.charAt(0).toUpperCase();
+            let details = userCacheDetails[activeContact] || await fetchUserDetailsForContact(activeContact);
+            
+            let name = activeContact;
+            let avatar = activeContact.charAt(0).toUpperCase();
+            let googleInfoHtml = "";
+
+            if (details && details.is_google) {
+                if (details.google_name) name = details.google_name;
+                if (details.profile_pic) avatar = `<img src="${details.profile_pic}">`;
+                googleInfoHtml = `<div style="background: rgba(66, 133, 244, 0.1); border: 1px solid #4285F4; padding: 6px 12px; border-radius: 8px; color: #4285F4; font-size: 12px; font-weight: 600; margin-bottom: 15px;">Verified Google Account</div>`;
+            }
+
+            document.getElementById("modalProfileName").innerText = name;
+            document.getElementById("modalProfileStatus").innerText = details ? details.status : (onlineUsers.includes(activeContact) ? "Online" : "Offline");
+            document.getElementById("modalProfileAvatar").innerHTML = avatar;
+            document.getElementById("googleProfileBadgeInfo").innerHTML = googleInfoHtml;
             
             const btnWrapper = document.getElementById("addToContactsBtnWrapper");
             if (savedContacts.includes(activeContact)) {
@@ -1165,7 +1259,7 @@ HTML_CONTENT = """
             messages.forEach(msg => {
                 if (filterQuery && !msg.content.toLowerCase().includes(filterQuery)) return;
                 if (msg.is_pinned) pinnedText = msg.content;
-                const isOutgoing = msg.sender === currentUser;
+                const isOutgoing = msg.sender === "You" || msg.sender === currentUser;
                 let contentHTML = "";
 
                 if (msg.view_once) {
