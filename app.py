@@ -6,7 +6,7 @@ import sqlite3
 import uuid
 from typing import Dict, List, Optional
 
-app = FastAPI(title="Metaverse_WhatsApp - Complete Edition")
+app = FastAPI(title="Metaverse_WhatsApp - Multimedia Edition")
 
 # ==================== DATABASE SETUP ====================
 def init_db():
@@ -182,21 +182,6 @@ async def get_history(user: str, contact: str):
     history = [{"id": r[0], "sender": r[1], "type": r[2], "content": r[3]} for r in rows]
     return {"history": history}
 
-@app.delete("/message/{msg_id}")
-async def delete_message(msg_id: int):
-    cursor.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
-    db_conn.commit()
-    return {"status": "deleted"}
-
-@app.delete("/clear-chat/{user}/{contact}")
-async def clear_chat(user: str, contact: str):
-    cursor.execute("""
-        DELETE FROM messages 
-        WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
-    """, (user, contact, contact, user))
-    db_conn.commit()
-    return {"status": "cleared"}
-
 @app.websocket("/ws/{username}")
 async def websocket_endpoint(websocket: WebSocket, username: str):
     await manager.connect(username, websocket)
@@ -210,6 +195,12 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
             content = message_data.get("message")
             is_group = message_data.get("is_group", False)
             
+            # Handle WebRTC signaling & Call requests directly
+            if msg_type in ["call_request", "call_response", "offer", "answer", "ice_candidate", "end_call"]:
+                message_data["sender_id"] = username
+                await manager.send_personal_message(message_data, recipient_id)
+                continue
+
             if is_group:
                 cursor.execute("INSERT INTO group_messages (group_id, sender, type, content) VALUES (?, ?, ?, ?)",
                                (recipient_id, username, msg_type, content))
@@ -217,7 +208,6 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 cursor.execute("SELECT last_insert_rowid()")
                 msg_id = cursor.fetchone()[0]
 
-                # Fetch group members
                 cursor.execute("SELECT members FROM groups WHERE group_id = ?", (recipient_id,))
                 row = cursor.fetchone()
                 if row:
@@ -231,15 +221,6 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                         "is_group": True
                     }
                     await manager.broadcast_to_group(recipient_id, payload, members)
-                continue
-
-            if msg_type == "delete_message":
-                msg_id = message_data.get("message_id")
-                if msg_id:
-                    cursor.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
-                    db_conn.commit()
-                    payload = {"type": "delete_message", "id": msg_id, "sender_id": username}
-                    await manager.send_personal_message(payload, recipient_id)
                 continue
 
             if msg_type in ["chat", "audio_note", "image"]:
@@ -269,7 +250,7 @@ HTML_CONTENT = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Metaverse WhatsApp - Full Persistence Edition</title>
+    <title>Metaverse WhatsApp - Multimedia & Call Edition</title>
     <link rel="icon" href="https://img.icons8.com/color/48/whatsapp--v1.png" type="image/png">
     <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
@@ -315,14 +296,12 @@ HTML_CONTENT = """
         
         #app-container { width: 98%; max-width: 1500px; height: 95vh; background: var(--bg-secondary); border: 1px solid var(--border); display: flex; box-shadow: 0 0 40px rgba(0, 0, 0, 0.5); border-radius: 18px; overflow: hidden; position: relative; }
         
-        /* Login Screen */
         #login-screen { position: absolute; inset: 0; background: var(--bg-primary); display: flex; justify-content: center; align-items: center; z-index: 200; padding: 15px; }
         #login-box { background: var(--bg-panel); border: 1px solid var(--border); padding: 40px 30px; border-radius: 20px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.3); width: 100%; max-width: 440px; }
         #login-box h1 { color: var(--accent); margin-bottom: 8px; font-size: 26px; font-weight: 700; }
         #login-box p { color: var(--text-muted); font-size: 13px; margin-bottom: 25px; }
         
         .google-btn-wrapper { display: flex; justify-content: center; margin-bottom: 20px; }
-        
         .divider { display: flex; align-items: center; text-align: center; color: var(--text-muted); font-size: 12px; margin: 18px 0; }
         .divider::before, .divider::after { content: ''; flex: 1; border-bottom: 1px solid var(--border); }
         .divider::before { margin-right: .5em; }
@@ -332,11 +311,13 @@ HTML_CONTENT = """
         #login-box input:focus { border-color: var(--accent); }
         #login-box button.manual-login { width: 100%; padding: 12px; background: var(--accent-gradient); color: #fff; border: none; border-radius: 10px; font-weight: bold; font-size: 14px; cursor: pointer; transition: 0.2s; }
 
-        /* Sidebar */
         .sidebar { width: 35%; background: var(--bg-panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; height: 100%; }
         .sidebar-header { padding: 16px 20px; background: var(--bg-secondary); display: flex; align-items: center; justify-content: space-between; height: 75px; border-bottom: 1px solid var(--border); }
         .my-profile { font-weight: 600; color: var(--accent); font-size: 14px; display: flex; align-items: center; gap: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 170px; cursor: pointer; }
-        .my-avatar-img { width: 36px; height: 36px; border-radius: 50%; object-fit: cover; border: 1px solid var(--accent); }
+        .contact-avatar { width: 48px; height: 48px; border-radius: 50%; background: var(--accent-gradient); color: white; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 18px; margin-right: 14px; position: relative; flex-shrink: 0; overflow: hidden; }
+        .contact-avatar img { width: 100%; height: 100%; object-fit: cover; }
+        .online-dot { width: 12px; height: 12px; background: #10b981; border: 2px solid var(--bg-panel); border-radius: 50%; position: absolute; bottom: 0; right: 0; }
+        .offline-dot { width: 12px; height: 12px; background: #6b7280; border: 2px solid var(--bg-panel); border-radius: 50%; position: absolute; bottom: 0; right: 0; }
         
         .sidebar-toolbar { padding: 12px 18px; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
         .sidebar-toolbar input { flex: 1; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: var(--text-main); font-size: 13px; outline: none; }
@@ -345,17 +326,12 @@ HTML_CONTENT = """
         .contacts-list { flex: 1; overflow-y: auto; }
         .contact-item { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border); cursor: pointer; transition: 0.2s; position: relative; }
         .contact-item:hover, .contact-item.active { background: var(--bg-secondary); border-left: 4px solid var(--accent); }
-        .contact-avatar { width: 48px; height: 48px; border-radius: 50%; background: var(--accent-gradient); color: white; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 18px; margin-right: 14px; position: relative; flex-shrink: 0; overflow: hidden; }
-        .contact-avatar img { width: 100%; height: 100%; object-fit: cover; }
-        .online-dot { width: 12px; height: 12px; background: #10b981; border: 2px solid var(--bg-panel); border-radius: 50%; position: absolute; bottom: 0; right: 0; }
-        .offline-dot { width: 12px; height: 12px; background: #6b7280; border: 2px solid var(--bg-panel); border-radius: 50%; position: absolute; bottom: 0; right: 0; }
         .contact-details h4 { font-size: 15px; color: var(--text-main); font-weight: 500; }
         .contact-details p { font-size: 12px; color: var(--accent); margin-top: 3px; }
 
-        /* Chat Panel */
         .chat-panel { flex: 1; display: flex; flex-direction: column; background: var(--bg-primary); position: relative; height: 100%; }
-        .chat-header { height: 75px; background: var(--bg-secondary); padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); cursor: pointer; }
-        .active-chat-info { display: flex; align-items: center; gap: 12px; }
+        .chat-header { height: 75px; background: var(--bg-secondary); padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); }
+        .active-chat-info { display: flex; align-items: center; gap: 12px; cursor: pointer; }
         .header-actions { display: flex; align-items: center; gap: 8px; }
         
         .header-btn { background: var(--bg-panel); color: var(--text-main); border: 1px solid var(--border); padding: 7px 12px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 500; transition: 0.2s; white-space: nowrap; }
@@ -370,14 +346,15 @@ HTML_CONTENT = """
         .msg-body { flex: 1; }
         .msg-ticks { font-size: 11px; float: right; margin-left: 10px; margin-top: 4px; color: rgba(255,255,255,0.8); }
 
-        /* Input Area */
         .chat-input-area { min-height: 75px; background: var(--bg-secondary); padding: 12px 18px; display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border); }
         .chat-input-area input { flex: 1; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-panel); color: var(--text-main); font-size: 14px; outline: none; }
         .chat-input-area input:focus { border-color: var(--accent); }
         .action-btn { background: none; border: none; font-size: 20px; cursor: pointer; color: var(--text-muted); padding: 4px; transition: 0.2s; }
         .action-btn:hover { color: var(--accent); }
+        .action-btn.recording { color: #ef4444; animation: pulse 1.2s infinite; }
 
-        /* Modals */
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+
         .modal-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.7); z-index: 300; display: flex; justify-content: center; align-items: center; backdrop-filter: blur(4px); padding: 20px; }
         .modal-content { background: var(--bg-panel); border: 1px solid var(--border); padding: 25px; border-radius: 16px; width: 100%; max-width: 420px; box-shadow: 0 15px 35px rgba(0,0,0,0.5); }
         .modal-content h3 { color: var(--accent); margin-bottom: 16px; font-size: 18px; }
@@ -385,6 +362,17 @@ HTML_CONTENT = """
         .modal-content input, .modal-content textarea { width: 100%; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: var(--text-main); font-size: 13px; outline: none; }
         .sel-btn { background: var(--bg-secondary); border: 1px solid var(--border); color: var(--text-main); padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13px; transition: 0.2s; }
         .sel-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+        /* Call Screen Modal */
+        #call-modal { position: absolute; inset: 0; background: rgba(0,0,0,0.92); z-index: 400; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+        .call-container { width: 90%; max-width: 800px; height: 75vh; background: var(--bg-panel); border-radius: 16px; border: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; position: relative; }
+        .call-videos { flex: 1; display: flex; background: #000; position: relative; justify-content: center; align-items: center; }
+        #remoteVideo { width: 100%; height: 100%; object-fit: cover; }
+        #localVideo { width: 140px; height: 100px; position: absolute; bottom: 15px; right: 15px; border-radius: 8px; border: 2px solid var(--accent); object-fit: cover; background: #111; }
+        .call-controls { height: 75px; background: var(--bg-secondary); display: flex; justify-content: center; align-items: center; gap: 20px; }
+        .call-btn { padding: 10px 22px; border-radius: 50px; border: none; font-weight: bold; cursor: pointer; font-size: 14px; }
+        .call-btn.end { background: #ef4444; color: white; }
+        .call-btn.accept { background: #10b981; color: white; }
 
         @media (max-width: 768px) {
             #app-container { width: 100%; height: 100vh; height: 100dvh; border-radius: 0; border: none; }
@@ -403,11 +391,11 @@ HTML_CONTENT = """
         <div id="login-screen">
             <div id="login-box">
                 <h1>⚡ Metaverse</h1>
-                <p>Persistent Quantum Chat Suite</p>
+                <p>Quantum Multimedia Suite</p>
                 
                 <div class="google-btn-wrapper">
                     <div id="g_id_onload"
-                         data-client_id="358332042325-3s7o118sjfv1qug4r6qlmf534083ti10.apps.googleusercontent.com"
+                         data-client_id="YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
                          data-callback="handleGoogleLogin"
                          data-auto_select="true">
                     </div>
@@ -442,14 +430,18 @@ HTML_CONTENT = """
 
         <!-- Chat Panel -->
         <div class="chat-panel">
-            <div class="chat-header" onclick="openContactProfile()">
-                <div class="active-chat-info">
+            <div class="chat-header">
+                <div class="active-chat-info" onclick="openContactProfile()">
                     <button class="header-btn hidden" id="backToContactsBtn" onclick="returnToSidebar(event)">⬅️</button>
                     <div class="contact-avatar" id="activeChatAvatar">?</div>
                     <div>
                         <h4 id="activeChatTitle" style="font-size: 15px; font-weight: 500;">Select Contact</h4>
                         <p id="activeChatStatus" style="font-size: 11px; color: var(--accent);">Ready</p>
                     </div>
+                </div>
+                <div class="header-actions" id="chatHeaderActions">
+                    <button class="header-btn" onclick="startCall('voice')" title="Voice Call">📞</button>
+                    <button class="header-btn" onclick="startCall('video')" title="Video Call">📹</button>
                 </div>
             </div>
 
@@ -461,6 +453,7 @@ HTML_CONTENT = """
 
             <div class="chat-input-area">
                 <label class="action-btn" title="Attach Image">📎<input type="file" id="imageInput" accept="image/*" style="display:none;" onchange="sendImage(event)"></label>
+                <button class="action-btn" id="voiceRecordBtn" title="Hold/Click to record voice note" onclick="toggleVoiceRecording()">🎤</button>
                 <input type="text" id="messageInput" placeholder="Type a message..." onkeypress="handleKey(event)" disabled>
                 <button class="action-btn" onclick="sendMessage()" style="color: var(--accent); font-size: 22px;" title="Send">➤</button>
             </div>
@@ -492,7 +485,7 @@ HTML_CONTENT = """
             </div>
         </div>
 
-        <!-- Contact Profile Modal ("Add to Contacts") -->
+        <!-- Contact Profile Modal -->
         <div id="contact-profile-modal" class="modal-overlay hidden">
             <div class="modal-content" style="text-align: center;">
                 <div class="contact-avatar" id="modalProfileAvatar" style="width: 80px; height: 80px; font-size: 32px; margin: 0 auto 15px auto;">?</div>
@@ -521,6 +514,35 @@ HTML_CONTENT = """
                 </div>
             </div>
         </div>
+
+        <!-- Call Modal -->
+        <div id="call-modal" class="hidden">
+            <div class="call-container">
+                <div style="padding: 15px 20px; background: var(--bg-secondary); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">
+                    <h4 id="callStatusTitle" style="color: var(--accent);">Secure Call in Progress</h4>
+                    <span id="callPartnerLabel" style="font-size: 13px; color: var(--text-muted);"></span>
+                </div>
+                <div class="call-videos">
+                    <video id="remoteVideo" autoplay playsinline></video>
+                    <video id="video-local" id="localVideo" autoplay playsinline muted style="width: 120px; height: 90px; position: absolute; bottom: 15px; right: 15px; border-radius: 8px; border: 2px solid var(--accent); object-fit: cover; background: #222;"></video>
+                </div>
+                <div class="call-controls">
+                    <button class="call-btn end" onclick="endCall()">End Call</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Incoming Call Modal -->
+        <div id="incoming-call-modal" class="modal-overlay hidden">
+            <div class="modal-content" style="text-align: center;">
+                <h3 id="incomingCallerTitle" style="margin-bottom: 10px;">Incoming Call</h3>
+                <p id="incomingCallTypeDesc" style="color: var(--text-muted); margin-bottom: 25px;">Incoming video/voice call...</p>
+                <div style="display: flex; gap: 12px;">
+                    <button class="sel-btn" style="flex: 1; background: #10b981; color: white;" onclick="acceptIncomingCall()">Accept</button>
+                    <button class="sel-btn" style="flex: 1; background: #ef4444; color: white;" onclick="rejectIncomingCall()">Reject</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -536,6 +558,21 @@ HTML_CONTENT = """
         let activeContact = null;
         let isGroupActive = false;
         let chatHistories = {};
+
+        // Audio recording state
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+
+        // WebRTC Call state
+        let peerConnection;
+        let localStream;
+        let remoteStream;
+        let currentCallType = null;
+        let incomingCallData = null;
+        let activeCallPartner = null;
+
+        const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
         window.onload = async function() {
             if (currentUser) {
@@ -603,9 +640,7 @@ HTML_CONTENT = """
         function setTheme(themeName, save = true) {
             currentTheme = themeName;
             document.body.className = `theme-${themeName}`;
-            if (save && currentUser) {
-                saveUserProfileToBackend();
-            }
+            if (save && currentUser) saveUserProfileToBackend();
         }
 
         async function saveUserProfileToBackend() {
@@ -622,9 +657,7 @@ HTML_CONTENT = """
             document.getElementById("settings-modal").classList.remove("hidden");
         }
 
-        function closeSettingsModal() {
-            document.getElementById("settings-modal").classList.add("hidden");
-        }
+        function closeSettingsModal() { document.getElementById("settings-modal").classList.add("hidden"); }
 
         async function saveSettings() {
             const newName = document.getElementById("settingsNameInput").value.trim();
@@ -652,9 +685,7 @@ HTML_CONTENT = """
         async function finishSavingSettings() {
             await saveUserProfileToBackend();
             document.getElementById("my-profile-display").innerText = currentUser;
-            if (userProfilePic) {
-                document.getElementById("myAvatarDisplay").innerHTML = `<img src="${userProfilePic}">`;
-            }
+            if (userProfilePic) document.getElementById("myAvatarDisplay").innerHTML = `<img src="${userProfilePic}">`;
             closeSettingsModal();
             alert("Settings saved successfully!");
         }
@@ -665,9 +696,7 @@ HTML_CONTENT = """
                 const data = await res.json();
                 savedContacts = data.contacts;
                 renderContacts();
-            } catch (err) {
-                console.error("Failed to load contacts", err);
-            }
+            } catch (err) { console.error("Failed to load contacts", err); }
         }
 
         async function fetchUserGroups() {
@@ -676,9 +705,7 @@ HTML_CONTENT = """
                 const data = await res.json();
                 userGroups = data.groups;
                 renderContacts();
-            } catch (err) {
-                console.error("Failed to load groups", err);
-            }
+            } catch (err) { console.error("Failed to load groups", err); }
         }
 
         function connectWebSocket() {
@@ -696,11 +723,38 @@ HTML_CONTENT = """
                     if (!chatHistories[gId]) chatHistories[gId] = [];
                     chatHistories[gId].push({ id: data.id, sender: data.sender_id, type: data.type, content: data.message });
                     if (activeContact === gId) renderMessages();
+                } else if (data.type === "call_request") {
+                    incomingCallData = data;
+                    document.getElementById("incomingCallerTitle").innerText = `${data.sender_id} is calling...`;
+                    document.getElementById("incomingCallTypeDesc").innerText = `Incoming ${data.call_type} call`;
+                    document.getElementById("incoming-call-modal").classList.remove("hidden");
+                } else if (data.type === "call_response") {
+                    if (data.accepted) {
+                        activeCallPartner = data.sender_id;
+                        document.getElementById("callPartnerLabel").innerText = `Connected with ${activeCallPartner}`;
+                        await setupWebRTCConnection(true);
+                    } else {
+                        alert("Call rejected.");
+                        closeCallModals();
+                    }
+                } else if (data.type === "offer") {
+                    if (!peerConnection) await setupWebRTCConnection(false);
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+                    const answer = await peerConnection.createAnswer();
+                    await peerConnection.setLocalDescription(answer);
+                    ws.send(JSON.stringify({ type: "answer", recipient_id: data.sender_id, answer: answer }));
+                } else if (data.type === "answer") {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+                } else if (data.type === "ice_candidate") {
+                    if (peerConnection && data.candidate) {
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                    }
+                } else if (data.type === "end_call") {
+                    closeCallModals();
                 } else {
                     const sender = data.sender_id;
                     if (!chatHistories[sender]) chatHistories[sender] = [];
                     chatHistories[sender].push({ id: data.id, sender: sender, type: data.type, content: data.message });
-                    
                     if (activeContact === sender) renderMessages();
                     renderContacts();
                 }
@@ -711,7 +765,6 @@ HTML_CONTENT = """
             const container = document.getElementById("contactsListContainer");
             container.innerHTML = "";
             
-            // Render Groups first
             userGroups.forEach(grp => {
                 if (!grp.group_name.toLowerCase().includes(filter.toLowerCase())) return;
                 const isActive = activeContact === grp.group_id ? "active" : "";
@@ -726,13 +779,11 @@ HTML_CONTENT = """
                 `;
             });
 
-            // Render Saved Contacts
             const allSet = new Set([...onlineUsers, ...savedContacts]);
             allSet.forEach(email => {
                 if (email === currentUser || !email.toLowerCase().includes(filter.toLowerCase())) return;
                 const isOnline = onlineUsers.includes(email);
                 const isActive = activeContact === email ? "active" : "";
-                const isSaved = savedContacts.includes(email);
 
                 container.innerHTML += `
                     <div class="contact-item ${isActive}" onclick="selectContact('${email}')">
@@ -748,9 +799,7 @@ HTML_CONTENT = """
             });
         }
 
-        function filterContacts() {
-            renderContacts(document.getElementById("searchContactInput").value);
-        }
+        function filterContacts() { renderContacts(document.getElementById("searchContactInput").value); }
 
         async function selectContact(email) {
             activeContact = email;
@@ -758,6 +807,7 @@ HTML_CONTENT = """
             document.getElementById("activeChatTitle").innerText = email;
             document.getElementById("activeChatStatus").innerText = onlineUsers.includes(email) ? "Online" : "Offline";
             document.getElementById("activeChatAvatar").innerHTML = email.charAt(0).toUpperCase();
+            document.getElementById("chatHeaderActions").classList.remove("hidden");
             
             document.getElementById("messageInput").disabled = false;
             document.getElementById("app-container").classList.add("mobile-chat-open");
@@ -779,6 +829,7 @@ HTML_CONTENT = """
             document.getElementById("activeChatTitle").innerText = groupName;
             document.getElementById("activeChatStatus").innerText = "Group Chat";
             document.getElementById("activeChatAvatar").innerHTML = "👥";
+            document.getElementById("chatHeaderActions").classList.add("hidden");
             
             document.getElementById("messageInput").disabled = false;
             document.getElementById("app-container").classList.add("mobile-chat-open");
@@ -815,9 +866,7 @@ HTML_CONTENT = """
             document.getElementById("contact-profile-modal").classList.remove("hidden");
         }
 
-        function closeContactProfile() {
-            document.getElementById("contact-profile-modal").classList.add("hidden");
-        }
+        function closeContactProfile() { document.getElementById("contact-profile-modal").classList.add("hidden"); }
 
         async function addCurrentContactPermanent() {
             if (!activeContact || savedContacts.includes(activeContact)) return;
@@ -847,9 +896,7 @@ HTML_CONTENT = """
             document.getElementById("group-modal").classList.remove("hidden");
         }
 
-        function closeGroupModal() {
-            document.getElementById("group-modal").classList.add("hidden");
-        }
+        function closeGroupModal() { document.getElementById("group-modal").classList.add("hidden"); }
 
         async function createGroupSubmit() {
             const groupName = document.getElementById("groupNameInput").value.trim();
@@ -873,6 +920,149 @@ HTML_CONTENT = """
             alert(`Group "${groupName}" created successfully!`);
         }
 
+        // ==================== MULTIMEDIA & CALL FUNCTIONS ====================
+        async function toggleVoiceRecording() {
+            const btn = document.getElementById("voiceRecordBtn");
+            if (!isRecording) {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaRecorder = new MediaRecorder(stream);
+                    audioChunks = [];
+                    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+                    mediaRecorder.onstop = async () => {
+                        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                        const reader = new FileReader();
+                        reader.onload = function() {
+                            ws.send(JSON.stringify({ type: "audio_note", recipient_id: activeContact, message: reader.result, is_group: isGroupActive }));
+                            if (!isGroupActive) {
+                                if (!chatHistories[activeContact]) chatHistories[activeContact] = [];
+                                chatHistories[activeContact].push({ id: Date.now(), sender: "You", type: "audio_note", content: reader.result });
+                                renderMessages();
+                            }
+                        };
+                        reader.readAsDataURL(audioBlob);
+                    };
+                    mediaRecorder.start();
+                    isRecording = true;
+                    btn.classList.add("recording");
+                    btn.title = "Click again to stop & send voice note";
+                } catch (err) {
+                    alert("Microphone access denied or unavailable.");
+                }
+            } else {
+                mediaRecorder.stop();
+                isRecording = false;
+                btn.classList.remove("recording");
+                btn.title = "Hold/Click to record voice note";
+            }
+        }
+
+        async function startCall(type) {
+            if (!activeContact || isGroupActive) return;
+            currentCallType = type;
+            activeCallPartner = activeContact;
+            
+            ws.send(JSON.stringify({
+                type: "call_request",
+                recipient_id: activeCallPartner,
+                call_type: type
+            }));
+            
+            document.getElementById("callPartnerLabel").innerText = `Calling ${activeCallPartner}...`;
+            document.getElementById("call-modal").classList.remove("hidden");
+        }
+
+        async function acceptIncomingCall() {
+            document.getElementById("incoming-call-modal").classList.add("hidden");
+            activeCallPartner = incomingCallData.sender_id;
+            currentCallType = incomingCallData.call_type;
+            
+            ws.send(JSON.stringify({
+                type: "call_response",
+                recipient_id: activeCallPartner,
+                accepted: true
+            }));
+            
+            document.getElementById("callPartnerLabel").innerText = `Connected with ${activeCallPartner}`;
+            document.getElementById("call-modal").classList.remove("hidden");
+            await setupWebRTCConnection(false);
+        }
+
+        function rejectIncomingCall() {
+            document.getElementById("incoming-call-modal").classList.add("hidden");
+            if (incomingCallData) {
+                ws.send(JSON.stringify({
+                    type: "call_response",
+                    recipient_id: incomingCallData.sender_id,
+                    accepted: false
+                }));
+            }
+            incomingCallData = null;
+        }
+
+        async function setupWebRTCConnection(isInitiator) {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    audio: true,
+                    video: currentCallType === 'video'
+                });
+                document.getElementById("video-local").srcObject = localStream;
+
+                peerConnection = new RTCPeerConnection(rtcConfig);
+                localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+                peerConnection.ontrack = event => {
+                    document.getElementById("remoteVideo").srcObject = event.streams[0];
+                };
+
+                peerConnection.onicecandidate = event => {
+                    if (event.candidate) {
+                        ws.send(JSON.stringify({
+                            type: "ice_candidate",
+                            recipient_id: activeCallPartner,
+                            candidate: event.candidate
+                        }));
+                    }
+                };
+
+                if (isInitiator) {
+                    const offer = await peerConnection.createOffer();
+                    await peerConnection.setLocalDescription(offer);
+                    ws.send(JSON.stringify({
+                        type: "offer",
+                        recipient_id: activeCallPartner,
+                        offer: offer
+                    }));
+                }
+            } catch (err) {
+                console.error("WebRTC Error:", err);
+                alert("Could not start media stream for call.");
+                closeCallModals();
+            }
+        }
+
+        function endCall() {
+            if (activeCallPartner) {
+                ws.send(JSON.stringify({ type: "end_call", recipient_id: activeCallPartner }));
+            }
+            closeCallModals();
+        }
+
+        function closeCallModals() {
+            document.getElementById("call-modal").classList.add("hidden");
+            document.getElementById("incoming-call-modal").classList.add("hidden");
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            activeCallPartner = null;
+            currentCallType = null;
+        }
+
         function renderMessages() {
             const container = document.getElementById("chatMessagesContainer");
             container.innerHTML = "";
@@ -880,7 +1070,14 @@ HTML_CONTENT = """
             
             messages.forEach(msg => {
                 const isOutgoing = msg.sender === "You" || msg.sender === currentUser;
-                let contentHTML = msg.type === "image" ? `<img src="${msg.content}" style="max-width: 220px; border-radius: 8px;">` : `<span>${msg.content}</span>`;
+                let contentHTML = "";
+                if (msg.type === "image") {
+                    contentHTML = `<img src="${msg.content}" style="max-width: 220px; border-radius: 8px;">`;
+                } else if (msg.type === "audio_note") {
+                    contentHTML = `<audio controls src="${msg.content}" style="max-width: 220px; height: 36px;"></audio>`;
+                } else {
+                    contentHTML = `<span>${msg.content}</span>`;
+                }
                 const senderLabel = isGroupActive && !isOutgoing ? `<div style="font-size: 11px; color: var(--accent); margin-bottom: 2px; font-weight: bold;">${msg.sender}</div>` : "";
 
                 container.innerHTML += `
