@@ -1,649 +1,946 @@
-import sqlite3
-from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 import json
-import os
-import shutil
+import sqlite3
+import uuid
+from typing import Dict, List, Optional
 
-app = FastAPI()
+app = FastAPI(title="Metaverse_WhatsApp - Complete Edition")
 
-DB_FILE = "whatsapp_clone.db"
-UPLOAD_DIR = "static_uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
+# ==================== DATABASE SETUP ====================
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect("metaverse_whatsapp.db", check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            phone TEXT PRIMARY KEY,
-            username TEXT,
-            about TEXT,
-            avatar TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS contacts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_phone TEXT,
-            contact_phone TEXT,
-            contact_name TEXT,
-            UNIQUE(user_phone, contact_phone)
-        )
-    """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sender TEXT,
             recipient TEXT,
+            type TEXT,
             content TEXT,
-            msg_type TEXT DEFAULT 'text',
-            file_url TEXT,
-            reactions TEXT DEFAULT '{}',
-            timestamp TEXT
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS statuses (
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            status TEXT,
+            profile_pic TEXT,
+            theme TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS saved_contacts (
+            username TEXT,
+            contact TEXT,
+            PRIMARY KEY (username, contact)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS groups (
+            group_id TEXT PRIMARY KEY,
+            group_name TEXT,
+            admin TEXT,
+            members TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS group_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT,
+            group_id TEXT,
+            sender TEXT,
+            type TEXT,
             content TEXT,
-            media_url TEXT,
-            timestamp TEXT
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
-    conn.close()
+    return conn
 
-init_db()
+db_conn = init_db()
+cursor = db_conn.cursor()
 
-# WebSocket Connection Manager
+# ==================== WEBSOCKET CONNECTION MANAGER ====================
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: dict[str, WebSocket] = {}
+        self.active_connections: Dict[str, WebSocket] = {}
 
-    async def connect(self, phone: str, websocket: WebSocket):
+    async def connect(self, username: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[phone] = websocket
+        self.active_connections[username] = websocket
+        await self.broadcast_user_list()
 
-    def disconnect(self, phone: str):
-        if phone in self.active_connections:
-            del self.active_connections[phone]
+    def disconnect(self, username: str):
+        if username in self.active_connections:
+            del self.active_connections[username]
 
-    async def send_personal(self, message: dict, phone: str):
-        if phone in self.active_connections:
-            await self.active_connections[phone].send_text(json.dumps(message))
+    async def broadcast_user_list(self):
+        user_list = list(self.active_connections.keys())
+        payload = {"type": "user_list", "users": user_list}
+        for connection in self.active_connections.values():
+            await connection.send_text(json.dumps(payload))
+
+    async def send_personal_message(self, message: dict, recipient: str):
+        if recipient in self.active_connections:
+            await self.active_connections[recipient].send_text(json.dumps(message))
+
+    async def broadcast_to_group(self, group_id: str, message: dict, members: list):
+        for member in members:
+            if member in self.active_connections:
+                await self.active_connections[member].send_text(json.dumps(message))
 
 manager = ConnectionManager()
 
-@app.get("/", response_class=HTMLResponse)
-async def get_chat_app():
-    return """
+# ==================== API ENDPOINTS ====================
+
+class UserProfile(BaseModel):
+    username: str
+    status: Optional[str] = None
+    profile_pic: Optional[str] = None
+    theme: Optional[str] = None
+
+@app.post("/user/update")
+async def update_user(profile: UserProfile):
+    cursor.execute("""
+        INSERT INTO users (username, status, profile_pic, theme) 
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(username) DO UPDATE SET 
+            status = COALESCE(?, status),
+            profile_pic = COALESCE(?, profile_pic),
+            theme = COALESCE(?, theme)
+    """, (profile.username, profile.status, profile.profile_pic, profile.theme,
+          profile.status, profile.profile_pic, profile.theme))
+    db_conn.commit()
+    return {"status": "success"}
+
+@app.get("/user/{username}")
+async def get_user(username: str):
+    cursor.execute("SELECT status, profile_pic, theme FROM users WHERE username = ?", (username,))
+    row = cursor.fetchone()
+    if row:
+        return {"status": row[0], "profile_pic": row[1], "theme": row[2]}
+    return {"status": "Hey there! I am using Metaverse WhatsApp", "profile_pic": None, "theme": "dark"}
+
+class ContactAdd(BaseModel):
+    username: str
+    contact: str
+
+@app.post("/contacts/add")
+async def add_contact(data: ContactAdd):
+    cursor.execute("INSERT OR IGNORE INTO saved_contacts (username, contact) VALUES (?, ?)", (data.username, data.contact))
+    db_conn.commit()
+    return {"status": "success"}
+
+@app.get("/contacts/{username}")
+async def get_saved_contacts(username: str):
+    cursor.execute("SELECT contact FROM saved_contacts WHERE username = ?", (username,))
+    rows = cursor.fetchall()
+    saved = [r[0] for r in rows]
+    return {"contacts": saved}
+
+class GroupCreate(BaseModel):
+    group_name: str
+    admin: str
+    members: List[str]
+
+@app.post("/groups/create")
+async def create_group(group: GroupCreate):
+    group_id = f"group_{uuid.uuid4().hex[:8]}"
+    all_members = list(set(group.members + [group.admin]))
+    cursor.execute("INSERT INTO groups (group_id, group_name, admin, members) VALUES (?, ?, ?, ?)",
+                   (group_id, group.group_name, group.admin, json.dumps(all_members)))
+    db_conn.commit()
+    return {"group_id": group_id, "group_name": group.group_name, "members": all_members}
+
+@app.get("/groups/{username}")
+async def get_user_groups(username: str):
+    cursor.execute("SELECT group_id, group_name, admin, members FROM groups")
+    rows = cursor.fetchall()
+    user_groups = []
+    for r in rows:
+        members = json.loads(r[3])
+        if username in members:
+            user_groups.append({"group_id": r[0], "group_name": r[1], "admin": r[2], "members": members})
+    return {"groups": user_groups}
+
+@app.get("/group-history/{group_id}")
+async def get_group_history(group_id: str):
+    cursor.execute("SELECT id, sender, type, content FROM group_messages WHERE group_id = ? ORDER BY id ASC", (group_id,))
+    rows = cursor.fetchall()
+    history = [{"id": r[0], "sender": r[1], "type": r[2], "content": r[3]} for r in rows]
+    return {"history": history}
+
+@app.get("/history/{user}/{contact}")
+async def get_history(user: str, contact: str):
+    cursor.execute("""
+        SELECT id, sender, type, content FROM messages 
+        WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
+        ORDER BY id ASC
+    """, (user, contact, contact, user))
+    rows = cursor.fetchall()
+    history = [{"id": r[0], "sender": r[1], "type": r[2], "content": r[3]} for r in rows]
+    return {"history": history}
+
+@app.delete("/message/{msg_id}")
+async def delete_message(msg_id: int):
+    cursor.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
+    db_conn.commit()
+    return {"status": "deleted"}
+
+@app.delete("/clear-chat/{user}/{contact}")
+async def clear_chat(user: str, contact: str):
+    cursor.execute("""
+        DELETE FROM messages 
+        WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
+    """, (user, contact, contact, user))
+    db_conn.commit()
+    return {"status": "cleared"}
+
+@app.websocket("/ws/{username}")
+async def websocket_endpoint(websocket: WebSocket, username: str):
+    await manager.connect(username, websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            message_data = json.loads(data)
+            
+            msg_type = message_data.get("type")
+            recipient_id = message_data.get("recipient_id")
+            content = message_data.get("message")
+            is_group = message_data.get("is_group", False)
+            
+            if is_group:
+                cursor.execute("INSERT INTO group_messages (group_id, sender, type, content) VALUES (?, ?, ?, ?)",
+                               (recipient_id, username, msg_type, content))
+                db_conn.commit()
+                cursor.execute("SELECT last_insert_rowid()")
+                msg_id = cursor.fetchone()[0]
+
+                # Fetch group members
+                cursor.execute("SELECT members FROM groups WHERE group_id = ?", (recipient_id,))
+                row = cursor.fetchone()
+                if row:
+                    members = json.loads(row[0])
+                    payload = {
+                        "id": msg_id,
+                        "group_id": recipient_id,
+                        "type": msg_type,
+                        "sender_id": username,
+                        "message": content,
+                        "is_group": True
+                    }
+                    await manager.broadcast_to_group(recipient_id, payload, members)
+                continue
+
+            if msg_type == "delete_message":
+                msg_id = message_data.get("message_id")
+                if msg_id:
+                    cursor.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
+                    db_conn.commit()
+                    payload = {"type": "delete_message", "id": msg_id, "sender_id": username}
+                    await manager.send_personal_message(payload, recipient_id)
+                continue
+
+            if msg_type in ["chat", "audio_note", "image"]:
+                cursor.execute("INSERT INTO messages (sender, recipient, type, content) VALUES (?, ?, ?, ?)", 
+                               (username, recipient_id, msg_type, content))
+                db_conn.commit()
+                cursor.execute("SELECT last_insert_rowid()")
+                msg_id = cursor.fetchone()[0]
+
+                payload = {
+                    "id": msg_id,
+                    "type": msg_type,
+                    "sender_id": username,
+                    "message": content
+                }
+                await manager.send_personal_message(payload, recipient_id)
+                
+    except WebSocketDisconnect:
+        manager.disconnect(username)
+        await manager.broadcast_user_list()
+
+
+# ==================== FRONTEND UI ====================
+HTML_CONTENT = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>WhatsApp Web Clone</title>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Metaverse WhatsApp - Full Persistence Edition</title>
+    <link rel="icon" href="https://img.icons8.com/color/48/whatsapp--v1.png" type="image/png">
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
         :root {
-            --bg-header: #00a884;
-            --bg-app-top: #00a884;
-            --bg-app-body: #efeae2;
-            --panel-bg: #ffffff;
-            --incoming-bg: #ffffff;
-            --outgoing-bg: #d9fdd3;
-            --text-primary: #111b21;
-            --text-secondary: #667781;
-            --border-color: #e9edef;
-            --input-bg: #f0f2f5;
+            --bg-primary: #080c14;
+            --bg-secondary: #111827;
+            --bg-panel: #1f2937;
+            --accent: #00f2fe;
+            --accent-gradient: linear-gradient(135deg, #00f2fe, #3b82f6);
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --border: #374151;
+            --outgoing: #059669;
         }
-        [data-theme="dark"] {
-            --bg-header: #202c33;
-            --bg-app-top: #111b21;
-            --bg-app-body: #0b141a;
-            --panel-bg: #111b21;
-            --incoming-bg: #202c33;
-            --outgoing-bg: #005c4b;
-            --text-primary: #e9edef;
-            --text-secondary: #8696a0;
-            --border-color: #222d34;
-            --input-bg: #2a3942;
+
+        body.theme-light {
+            --bg-primary: #f0f2f5;
+            --bg-secondary: #ffffff;
+            --bg-panel: #ffffff;
+            --accent: #00a884;
+            --accent-gradient: linear-gradient(135deg, #00a884, #005c4b);
+            --text-main: #111827;
+            --text-muted: #6b7280;
+            --border: #e5e7eb;
+            --outgoing: #00a884;
         }
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Helvetica, Arial, sans-serif; }
-        body { background-color: var(--bg-app-body); height: 100vh; display: flex; justify-content: center; align-items: center; overflow: hidden; }
-        
-        /* Containers */
-        #auth-container, #app-container { width: 100vw; height: 100vh; display: flex; }
-        #app-container { max-width: 1600px; max-height: 95vh; box-shadow: 0 6px 18px rgba(0,0,0,0.2); border-radius: 8px; overflow: hidden; }
+
+        body.theme-dark {
+            --bg-primary: #080c14;
+            --bg-secondary: #111827;
+            --bg-panel: #1f2937;
+            --accent: #00f2fe;
+            --accent-gradient: linear-gradient(135deg, #00f2fe, #3b82f6);
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --border: #374151;
+            --outgoing: #059669;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
+        body { background: var(--bg-primary); height: 100vh; display: flex; justify-content: center; align-items: center; color: var(--text-main); overflow: hidden; }
         .hidden { display: none !important; }
-
-        /* Auth Screen */
-        #auth-container { background: var(--bg-app-body); justify-content: center; align-items: center; }
-        .auth-card { background: var(--panel-bg); padding: 40px; border-radius: 12px; width: 400px; text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.1); color: var(--text-primary); }
-        .auth-card h2 { margin-bottom: 20px; color: var(--bg-header); }
-        .auth-card input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid var(--border-color); border-radius: 6px; background: var(--input-bg); color: var(--text-primary); }
-        .auth-card button { width: 100%; padding: 12px; background: #00a884; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 10px; }
-
-        /* Left Sidebar */
-        .sidebar { width: 35%; background: var(--panel-bg); border-right: 1px solid var(--border-color); display: flex; flex-direction: column; }
-        .sidebar-header { padding: 10px 16px; background: var(--bg-header); display: flex; justify-content: space-between; align-items: center; color: white; height: 60px; }
-        .sidebar-header .icons i { margin-left: 20px; cursor: pointer; font-size: 18px; }
         
-        .search-bar { padding: 8px 12px; background: var(--panel-bg); border-bottom: 1px solid var(--border-color); display: flex; align-items: center; }
-        .search-bar input { width: 100%; padding: 8px 12px 8px 32px; border-radius: 8px; border: none; background: var(--input-bg); color: var(--text-primary); outline: none; }
-        .search-wrapper { position: relative; width: 100%; }
-        .search-wrapper i { position: absolute; left: 10px; top: 10px; color: var(--text-secondary); }
-
-        .chat-list { flex: 1; overflow-y: auto; }
-        .chat-item { display: flex; padding: 12px 16px; cursor: pointer; border-bottom: 1px solid var(--border-color); align-items: center; }
-        .chat-item:hover, .chat-item.active { background: var(--input-bg); }
-        .avatar { width: 45px; height: 45px; border-radius: 50%; background: #dfe5e7; display: flex; justify-content: center; align-items: center; font-weight: bold; color: #54656f; margin-right: 15px; flex-shrink: 0; }
-        .chat-info { flex: 1; overflow: hidden; }
-        .chat-info .top-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
-        .chat-info .name { font-weight: 600; color: var(--text-primary); }
-        .chat-info .time { font-size: 12px; color: var(--text-secondary); }
-        .chat-info .preview { font-size: 13px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
-        /* Main Chat Area */
-        .main-chat { flex: 65%; display: flex; flex-direction: column; background: var(--bg-app-body); }
-        .chat-header { padding: 10px 16px; background: var(--panel-bg); display: flex; justify-content: space-between; align-items: center; height: 60px; border-left: 1px solid var(--border-color); }
-        .chat-header-user { display: flex; align-items: center; }
+        #app-container { width: 98%; max-width: 1500px; height: 95vh; background: var(--bg-secondary); border: 1px solid var(--border); display: flex; box-shadow: 0 0 40px rgba(0, 0, 0, 0.5); border-radius: 18px; overflow: hidden; position: relative; }
         
-        .messages-container { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; background-image: radial-gradient(#cbd5e1 1px, transparent 1px); background-size: 20px 20px; }
-        [data-theme="dark"] .messages-container { background-image: radial-gradient(#1f2c34 1px, transparent 1px); }
-
-        .message { max-width: 65%; padding: 8px 12px; border-radius: 8px; position: relative; font-size: 14px; word-wrap: break-word; color: var(--text-primary); box-shadow: 0 1px 0.5px rgba(0,0,0,0.13); }
-        .message.incoming { background: var(--incoming-bg); align-self: flex-start; border-top-left-radius: 0; }
-        .message.outgoing { background: var(--outgoing-bg); align-self: flex-end; border-top-right-radius: 0; }
-        .message .meta { font-size: 10px; color: var(--text-secondary); float: right; margin-left: 10px; margin-top: 4px; display: flex; align-items: center; gap: 3px; }
+        /* Login Screen */
+        #login-screen { position: absolute; inset: 0; background: var(--bg-primary); display: flex; justify-content: center; align-items: center; z-index: 200; padding: 15px; }
+        #login-box { background: var(--bg-panel); border: 1px solid var(--border); padding: 40px 30px; border-radius: 20px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.3); width: 100%; max-width: 440px; }
+        #login-box h1 { color: var(--accent); margin-bottom: 8px; font-size: 26px; font-weight: 700; }
+        #login-box p { color: var(--text-muted); font-size: 13px; margin-bottom: 25px; }
         
-        /* Chat Input Box */
-        .chat-input-area { padding: 10px 16px; background: var(--panel-bg); display: flex; align-items: center; gap: 10px; height: 62px; }
-        .chat-input-area i { font-size: 20px; color: var(--text-secondary); cursor: pointer; }
-        .chat-input-area input { flex: 1; padding: 10px 14px; border-radius: 8px; border: none; background: var(--input-bg); color: var(--text-primary); outline: none; font-size: 15px; }
+        .google-btn-wrapper { display: flex; justify-content: center; margin-bottom: 20px; }
+        
+        .divider { display: flex; align-items: center; text-align: center; color: var(--text-muted); font-size: 12px; margin: 18px 0; }
+        .divider::before, .divider::after { content: ''; flex: 1; border-bottom: 1px solid var(--border); }
+        .divider::before { margin-right: .5em; }
+        .divider::after { margin-left: .5em; }
 
-        /* Modal / Tabs for Status & Groups */
-        .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: flex; justify-content: center; align-items: center; z-index: 1000; }
-        .modal-content { background: var(--panel-bg); padding: 30px; border-radius: 8px; width: 400px; color: var(--text-primary); }
-        .modal-content input, .modal-content textarea { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid var(--border-color); border-radius: 6px; background: var(--input-bg); color: var(--text-primary); }
+        #login-box input { width: 100%; padding: 12px 16px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; color: var(--text-main); font-size: 14px; outline: none; margin-bottom: 14px; text-align: center; }
+        #login-box input:focus { border-color: var(--accent); }
+        #login-box button.manual-login { width: 100%; padding: 12px; background: var(--accent-gradient); color: #fff; border: none; border-radius: 10px; font-weight: bold; font-size: 14px; cursor: pointer; transition: 0.2s; }
+
+        /* Sidebar */
+        .sidebar { width: 35%; background: var(--bg-panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; height: 100%; }
+        .sidebar-header { padding: 16px 20px; background: var(--bg-secondary); display: flex; align-items: center; justify-content: space-between; height: 75px; border-bottom: 1px solid var(--border); }
+        .my-profile { font-weight: 600; color: var(--accent); font-size: 14px; display: flex; align-items: center; gap: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 170px; cursor: pointer; }
+        .my-avatar-img { width: 36px; height: 36px; border-radius: 50%; object-fit: cover; border: 1px solid var(--accent); }
+        
+        .sidebar-toolbar { padding: 12px 18px; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
+        .sidebar-toolbar input { flex: 1; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: var(--text-main); font-size: 13px; outline: none; }
+        .sidebar-toolbar input:focus { border-color: var(--accent); }
+        
+        .contacts-list { flex: 1; overflow-y: auto; }
+        .contact-item { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border); cursor: pointer; transition: 0.2s; position: relative; }
+        .contact-item:hover, .contact-item.active { background: var(--bg-secondary); border-left: 4px solid var(--accent); }
+        .contact-avatar { width: 48px; height: 48px; border-radius: 50%; background: var(--accent-gradient); color: white; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 18px; margin-right: 14px; position: relative; flex-shrink: 0; overflow: hidden; }
+        .contact-avatar img { width: 100%; height: 100%; object-fit: cover; }
+        .online-dot { width: 12px; height: 12px; background: #10b981; border: 2px solid var(--bg-panel); border-radius: 50%; position: absolute; bottom: 0; right: 0; }
+        .offline-dot { width: 12px; height: 12px; background: #6b7280; border: 2px solid var(--bg-panel); border-radius: 50%; position: absolute; bottom: 0; right: 0; }
+        .contact-details h4 { font-size: 15px; color: var(--text-main); font-weight: 500; }
+        .contact-details p { font-size: 12px; color: var(--accent); margin-top: 3px; }
+
+        /* Chat Panel */
+        .chat-panel { flex: 1; display: flex; flex-direction: column; background: var(--bg-primary); position: relative; height: 100%; }
+        .chat-header { height: 75px; background: var(--bg-secondary); padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); cursor: pointer; }
+        .active-chat-info { display: flex; align-items: center; gap: 12px; }
+        .header-actions { display: flex; align-items: center; gap: 8px; }
+        
+        .header-btn { background: var(--bg-panel); color: var(--text-main); border: 1px solid var(--border); padding: 7px 12px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 500; transition: 0.2s; white-space: nowrap; }
+        .header-btn:hover { border-color: var(--accent); color: var(--accent); }
+        
+        .chat-messages { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+        
+        .message { max-width: 75%; padding: 12px 16px; border-radius: 12px; font-size: 14px; line-height: 22px; word-wrap: break-word; position: relative; box-shadow: 0 2px 5px rgba(0,0,0,0.1); display: flex; align-items: flex-start; gap: 10px; }
+        .message.incoming { background: var(--bg-panel); border: 1px solid var(--border); align-self: flex-start; border-top-left-radius: 2px; color: var(--text-main); }
+        .message.outgoing { background: var(--outgoing); align-self: flex-end; border-top-right-radius: 2px; color: white; }
+        
+        .msg-body { flex: 1; }
+        .msg-ticks { font-size: 11px; float: right; margin-left: 10px; margin-top: 4px; color: rgba(255,255,255,0.8); }
+
+        /* Input Area */
+        .chat-input-area { min-height: 75px; background: var(--bg-secondary); padding: 12px 18px; display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border); }
+        .chat-input-area input { flex: 1; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-panel); color: var(--text-main); font-size: 14px; outline: none; }
+        .chat-input-area input:focus { border-color: var(--accent); }
+        .action-btn { background: none; border: none; font-size: 20px; cursor: pointer; color: var(--text-muted); padding: 4px; transition: 0.2s; }
+        .action-btn:hover { color: var(--accent); }
+
+        /* Modals */
+        .modal-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.7); z-index: 300; display: flex; justify-content: center; align-items: center; backdrop-filter: blur(4px); padding: 20px; }
+        .modal-content { background: var(--bg-panel); border: 1px solid var(--border); padding: 25px; border-radius: 16px; width: 100%; max-width: 420px; box-shadow: 0 15px 35px rgba(0,0,0,0.5); }
+        .modal-content h3 { color: var(--accent); margin-bottom: 16px; font-size: 18px; }
+        .modal-content label { font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px; margin-top: 12px; }
+        .modal-content input, .modal-content textarea { width: 100%; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: var(--text-main); font-size: 13px; outline: none; }
+        .sel-btn { background: var(--bg-secondary); border: 1px solid var(--border); color: var(--text-main); padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13px; transition: 0.2s; }
+        .sel-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+        @media (max-width: 768px) {
+            #app-container { width: 100%; height: 100vh; height: 100dvh; border-radius: 0; border: none; }
+            .sidebar { width: 100%; display: flex; }
+            .chat-panel { width: 100%; display: none; }
+            #app-container.mobile-chat-open .sidebar { display: none; }
+            #app-container.mobile-chat-open .chat-panel { display: flex; }
+            #backToContactsBtn { display: inline-block !important; }
+        }
     </style>
 </head>
-<body data-theme="light">
+<body class="theme-dark">
 
-    <!-- AUTH SCREEN -->
-    <div id="auth-container">
-        <div class="auth-card" id="phoneStep1">
-            <h2>WhatsApp Sign In</h2>
-            <p style="color: var(--text-secondary); font-size: 14px; margin-bottom: 15px;">Enter your mobile number to get started</p>
-            <input type="text" id="loginPhoneInput" placeholder="Phone (e.g. +1234567890)">
-            <button onclick="sendOtpCode()">Next</button>
-        </div>
-        <div class="auth-card hidden" id="phoneStep2">
-            <h2>Verify OTP</h2>
-            <p id="otpInfoText" style="color: var(--text-secondary); font-size: 14px; margin-bottom: 15px;"></p>
-            <input type="text" id="otpCodeInput" placeholder="Enter 4-digit OTP">
-            <button onclick="verifyOtpCode()">Verify & Login</button>
-        </div>
-        <div class="auth-card hidden" id="profileStep">
-            <h2>Profile Info</h2>
-            <input type="text" id="usernameInput" placeholder="Your Name">
-            <input type="text" id="aboutInput" placeholder="About (e.g. Busy)">
-            <button onclick="completeLogin()">Start Messaging</button>
-        </div>
-    </div>
+    <div id="app-container">
+        <!-- Login Screen -->
+        <div id="login-screen">
+            <div id="login-box">
+                <h1>⚡ Metaverse</h1>
+                <p>Persistent Quantum Chat Suite</p>
+                
+                <div class="google-btn-wrapper">
+                    <div id="g_id_onload"
+                         data-client_id="358332042325-3s7o118sjfv1qug4r6qlmf534083ti10.apps.googleusercontent.com"
+                         data-callback="handleGoogleLogin"
+                         data-auto_select="true">
+                    </div>
+                    <div class="g_id_signin" data-type="standard" data-shape="pill" data-theme="filled_black" data-size="large"></div>
+                </div>
 
-    <!-- MAIN APP SCREEN -->
-    <div id="app-container" class="hidden">
-        <!-- SIDEBAR -->
+                <div class="divider">or quick manual access</div>
+                
+                <input type="text" id="loginUsernameInput" placeholder="Enter custom username..." onkeypress="handleLoginKey(event)">
+                <button class="manual-login" onclick="performManualLogin()">Initialize Session</button>
+            </div>
+        </div>
+
+        <!-- Sidebar -->
         <div class="sidebar">
             <div class="sidebar-header">
-                <div class="avatar" id="myAvatar" style="cursor: pointer;" onclick="openProfileSettings()">U</div>
-                <div class="icons">
-                    <i class="fa-solid fa-circle-notch" title="Status" onclick="openStatusModal()"></i>
-                    <i class="fa-solid fa-users" title="New Group" onclick="openGroupModal()"></i>
-                    <i class="fa-solid fa-message" title="New Chat" onclick="openNewContactModal()"></i>
-                    <i class="fa-solid fa-moon" title="Toggle Theme" onclick="toggleTheme()"></i>
+                <div class="my-profile" onclick="openSettingsModal()">
+                    <div class="contact-avatar" id="myAvatarDisplay" style="width: 36px; height: 36px; font-size: 14px; margin-right: 0;">⚡</div>
+                    <span id="my-profile-display">Node</span>
+                </div>
+                <div style="display: flex; gap: 6px;">
+                    <button class="header-btn" onclick="openGroupModal()" title="New Group">👥 Group</button>
+                    <button class="header-btn" onclick="openSettingsModal()" title="Settings">⚙️</button>
+                    <button class="header-btn" onclick="logout()" title="Logout" style="font-size: 11px;">Logout</button>
                 </div>
             </div>
-            <div class="search-bar">
-                <div class="search-wrapper">
-                    <i class="fa-solid fa-magnifying-glass"></i>
-                    <input type="text" placeholder="Search or start new chat" id="chatSearch" onkeyup="filterChats()">
-                </div>
+            <div class="sidebar-toolbar">
+                <input type="text" id="searchContactInput" placeholder="Search saved contacts..." oninput="filterContacts()">
             </div>
-            <div class="chat-list" id="chatListContainer">
-                <!-- Chats dynamically loaded -->
-            </div>
+            <div class="contacts-list" id="contactsListContainer"></div>
         </div>
 
-        <!-- MAIN CHAT -->
-        <div class="main-chat">
-            <div class="chat-header">
-                <div class="chat-header-user">
-                    <div class="avatar" id="activeChatAvatar">#</div>
+        <!-- Chat Panel -->
+        <div class="chat-panel">
+            <div class="chat-header" onclick="openContactProfile()">
+                <div class="active-chat-info">
+                    <button class="header-btn hidden" id="backToContactsBtn" onclick="returnToSidebar(event)">⬅️</button>
+                    <div class="contact-avatar" id="activeChatAvatar">?</div>
                     <div>
-                        <div class="name" id="activeChatName" style="font-weight: 600; color: var(--text-primary);">Select a chat</div>
-                        <div class="preview" id="typingIndicator" style="font-size: 12px; color: var(--bg-header);"></div>
+                        <h4 id="activeChatTitle" style="font-size: 15px; font-weight: 500;">Select Contact</h4>
+                        <p id="activeChatStatus" style="font-size: 11px; color: var(--accent);">Ready</p>
                     </div>
                 </div>
-                <div class="icons" style="display: flex; gap: 20px; color: var(--text-secondary);">
-                    <i class="fa-solid fa-paperclip" onclick="triggerFileUpload()" title="Attach File"></i>
-                    <i class="fa-solid fa-ellipsis-vertical"></i>
+            </div>
+
+            <div class="chat-messages" id="chatMessagesContainer">
+                <div style="text-align: center; margin: auto; color: var(--text-muted); font-size: 13px;">
+                    <p>🔒 Select a contact or group to begin secure communication.</p>
                 </div>
             </div>
 
-            <div class="messages-container" id="messagesContainer">
-                <div style="margin: auto; text-align: center; color: var(--text-secondary);">
-                    <i class="fa-brands fa-whatsapp" style="font-size: 64px; margin-bottom: 10px; color: #00a884;"></i>
-                    <h3>WhatsApp Web Clone</h3>
-                    <p>Send and receive messages securely with real-time sync.</p>
+            <div class="chat-input-area">
+                <label class="action-btn" title="Attach Image">📎<input type="file" id="imageInput" accept="image/*" style="display:none;" onchange="sendImage(event)"></label>
+                <input type="text" id="messageInput" placeholder="Type a message..." onkeypress="handleKey(event)" disabled>
+                <button class="action-btn" onclick="sendMessage()" style="color: var(--accent); font-size: 22px;" title="Send">➤</button>
+            </div>
+        </div>
+
+        <!-- Settings Modal -->
+        <div id="settings-modal" class="modal-overlay hidden">
+            <div class="modal-content">
+                <h3>⚙️ Settings & Profile</h3>
+                <label>Display Name</label>
+                <input type="text" id="settingsNameInput">
+                
+                <label>About / Status</label>
+                <textarea id="settingsStatusInput" rows="2"></textarea>
+                
+                <label>Profile Picture</label>
+                <input type="file" id="settingsPicInput" accept="image/*" style="padding: 6px; background: var(--bg-secondary);">
+
+                <label>Theme Mode</label>
+                <div style="display: flex; gap: 10px; margin-top: 6px; margin-bottom: 20px;">
+                    <button class="sel-btn" style="flex:1;" onclick="setTheme('dark')">🌙 Dark Mode</button>
+                    <button class="sel-btn" style="flex:1;" onclick="setTheme('light')">☀️ Light Mode</button>
+                </div>
+
+                <div style="display: flex; gap: 10px;">
+                    <button class="sel-btn" style="flex: 1; background: var(--accent-gradient); color: white;" onclick="saveSettings()">Save Changes</button>
+                    <button class="sel-btn" style="flex: 1;" onclick="closeSettingsModal()">Cancel</button>
                 </div>
             </div>
+        </div>
 
-            <div class="chat-input-area" id="inputArea" style="display: none;">
-                <i class="fa-regular fa-face-smile" onclick="toggleEmojiPicker()"></i>
-                <input type="file" id="fileInput" style="display: none;" onchange="uploadFile(this)">
-                <input type="text" id="messageInput" placeholder="Type a message" onkeypress="handleKeyPress(event)" oninput="sendTypingSignal()">
-                <i class="fa-solid fa-microphone" onclick="sendVoiceNote()" title="Voice Note"></i>
-                <i class="fa-solid fa-paper-plane" onclick="sendMessage()"></i>
+        <!-- Contact Profile Modal ("Add to Contacts") -->
+        <div id="contact-profile-modal" class="modal-overlay hidden">
+            <div class="modal-content" style="text-align: center;">
+                <div class="contact-avatar" id="modalProfileAvatar" style="width: 80px; height: 80px; font-size: 32px; margin: 0 auto 15px auto;">?</div>
+                <h3 id="modalProfileName" style="margin-bottom: 5px;">Contact Name</h3>
+                <p id="modalProfileStatus" style="color: var(--text-muted); font-size: 13px; margin-bottom: 20px;">Status here...</p>
+                <div id="addToContactsBtnWrapper">
+                    <button class="sel-btn" style="width: 100%; background: var(--accent-gradient); color: white; margin-bottom: 10px;" onclick="addCurrentContactPermanent()">➕ Add to Contacts</button>
+                </div>
+                <button class="sel-btn" style="width: 100%;" onclick="closeContactProfile()">Close</button>
             </div>
         </div>
-    </div>
 
-    <!-- MODALS -->
-    <div id="contactModal" class="modal hidden">
-        <div class="modal-content">
-            <h3>Add Contact</h3>
-            <input type="text" id="newContactPhone" placeholder="Contact Phone (+1234...)">
-            <input type="text" id="newContactName" placeholder="Contact Name">
-            <button onclick="addContact()">Add</button>
-            <button onclick="closeModals()" style="background: #ea4335; margin-top: 5px;">Cancel</button>
-        </div>
-    </div>
+        <!-- Create Group Modal -->
+        <div id="group-modal" class="modal-overlay hidden">
+            <div class="modal-content">
+                <h3>👥 Create New Group</h3>
+                <label>Group Name</label>
+                <input type="text" id="groupNameInput" placeholder="Enter group name...">
+                
+                <label>Select Members</label>
+                <div id="groupMembersList" style="max-height: 180px; overflow-y: auto; margin-top: 6px; margin-bottom: 16px; border: 1px solid var(--border); border-radius: 8px; padding: 10px;"></div>
 
-    <div id="groupModal" class="modal hidden">
-        <div class="modal-content">
-            <h3>Create Group</h3>
-            <input type="text" id="groupNameInput" placeholder="Group Subject">
-            <button onclick="createGroup()">Create</button>
-            <button onclick="closeModals()" style="background: #ea4335; margin-top: 5px;">Cancel</button>
-        </div>
-    </div>
-
-    <div id="statusModal" class="modal hidden">
-        <div class="modal-content" style="max-height: 80vh; overflow-y: auto;">
-            <h3>Statuses (24h)</h3>
-            <div id="statusFeed" style="margin: 15px 0;"></div>
-            <textarea id="statusTextInput" placeholder="Type a status update..."></textarea>
-            <button onclick="postStatus()">Post Status</button>
-            <button onclick="closeModals()" style="background: #ea4335; margin-top: 5px;">Close</button>
+                <div style="display: flex; gap: 10px;">
+                    <button class="sel-btn" style="flex: 1; background: var(--accent-gradient); color: white;" onclick="createGroupSubmit()">Create Group</button>
+                    <button class="sel-btn" style="flex: 1;" onclick="closeGroupModal()">Cancel</button>
+                </div>
+            </div>
         </div>
     </div>
 
     <script>
-        let currentUser = null;
-        let activeRecipient = null;
-        let ws = null;
-        let generatedOtpCode = "";
-        let typingTimeout = null;
+        let ws;
+        let currentUser = localStorage.getItem("metaverse_user") || null;
+        let userStatus = "Hey there! I am using Metaverse WhatsApp";
+        let userProfilePic = "";
+        let currentTheme = "dark";
+        
+        let onlineUsers = [];
+        let savedContacts = [];
+        let userGroups = [];
+        let activeContact = null;
+        let isGroupActive = false;
+        let chatHistories = {};
 
-        function sendOtpCode() {
-            const phone = document.getElementById("loginPhoneInput").value.trim();
-            if (!phone) { alert("Enter a valid phone number"); return; }
-            generatedOtpCode = Math.floor(1000 + Math.random() * 9000).toString();
-            // FIXED: Proper JS property setting syntax below
-            document.getElementById("otpInfoText").innerHTML = `📱 [Simulated SMS Sent]: Your OTP code is <b>${generatedOtpCode}</b>`;
-            document.getElementById("phoneStep1").classList.add("hidden");
-            document.getElementById("phoneStep2").classList.remove("hidden");
-        }
+        window.onload = async function() {
+            if (currentUser) {
+                await fetchUserData(currentUser);
+                initializeUserSession(currentUser);
+            }
+        };
 
-        function verifyOtpCode() {
-            const code = document.getElementById("otpCodeInput").value.trim();
-            if (code === generatedOtpCode) {
-                document.getElementById("phoneStep2").classList.add("hidden");
-                document.getElementById("profileStep").classList.remove("hidden");
-            } else {
-                alert("Incorrect OTP code!");
+        async function fetchUserData(username) {
+            try {
+                const res = await fetch(`/user/${encodeURIComponent(username)}`);
+                const data = await res.json();
+                userStatus = data.status || userStatus;
+                userProfilePic = data.profile_pic || "";
+                currentTheme = data.theme || "dark";
+                setTheme(currentTheme, false);
+            } catch (err) {
+                console.error("Failed to fetch user data", err);
             }
         }
 
-        async function completeLogin() {
-            const phone = document.getElementById("loginPhoneInput").value.trim();
-            const username = document.getElementById("usernameInput").value.trim() || "WhatsApp User";
-            const about = document.getElementById("aboutInput").value.trim() || "Available";
-
-            const res = await fetch('/api/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ phone, username, about })
-            });
-            currentUser = await res.json();
-            
-            document.getElementById("auth-container").classList.add("hidden");
-            document.getElementById("app-container").classList.remove("hidden");
-            document.getElementById("myAvatar").innerText = currentUser.username.charAt(0).toUpperCase();
-
-            initWebSocket();
-            loadContacts();
+        function handleGoogleLogin(response) {
+            try {
+                const base64Url = response.credential.split('.')[1];
+                const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+                const jsonPayload = decodeURIComponent(atob(base64).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+                const payload = JSON.parse(jsonPayload);
+                if (payload.email) initializeUserSession(payload.email);
+            } catch (err) {
+                alert("Google Sign-In verification error.");
+            }
         }
 
-        function initWebSocket() {
-            ws = new WebSocket(`ws://${window.location.host}/ws/${currentUser.phone}`);
-            ws.onmessage = function(event) {
+        function handleLoginKey(e) { if (e.key === "Enter") performManualLogin(); }
+
+        async function performManualLogin() {
+            const val = document.getElementById("loginUsernameInput").value.trim();
+            if (!val) { alert("Please enter a username."); return; }
+            await fetchUserData(val);
+            initializeUserSession(val);
+        }
+
+        async function initializeUserSession(username) {
+            currentUser = username;
+            localStorage.setItem("metaverse_user", currentUser);
+
+            document.getElementById("my-profile-display").innerText = currentUser;
+            if (userProfilePic) {
+                document.getElementById("myAvatarDisplay").innerHTML = `<img src="${userProfilePic}">`;
+            } else {
+                document.getElementById("myAvatarDisplay").innerText = currentUser.charAt(0).toUpperCase();
+            }
+
+            document.getElementById("login-screen").classList.add("hidden");
+            connectWebSocket();
+            await fetchSavedContacts();
+            await fetchUserGroups();
+        }
+
+        function logout() {
+            localStorage.removeItem("metaverse_user");
+            location.reload();
+        }
+
+        function setTheme(themeName, save = true) {
+            currentTheme = themeName;
+            document.body.className = `theme-${themeName}`;
+            if (save && currentUser) {
+                saveUserProfileToBackend();
+            }
+        }
+
+        async function saveUserProfileToBackend() {
+            await fetch("/user/update", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ username: currentUser, status: userStatus, profile_pic: userProfilePic, theme: currentTheme })
+            });
+        }
+
+        function openSettingsModal() {
+            document.getElementById("settingsNameInput").value = currentUser;
+            document.getElementById("settingsStatusInput").value = userStatus;
+            document.getElementById("settings-modal").classList.remove("hidden");
+        }
+
+        function closeSettingsModal() {
+            document.getElementById("settings-modal").classList.add("hidden");
+        }
+
+        async function saveSettings() {
+            const newName = document.getElementById("settingsNameInput").value.trim();
+            const newStatus = document.getElementById("settingsStatusInput").value.trim();
+            const picFile = document.getElementById("settingsPicInput").files[0];
+
+            if (newName && newName !== currentUser) {
+                currentUser = newName;
+                localStorage.setItem("metaverse_user", currentUser);
+            }
+            if (newStatus) userStatus = newStatus;
+
+            if (picFile) {
+                const reader = new FileReader();
+                reader.onload = async function() {
+                    userProfilePic = reader.result;
+                    await finishSavingSettings();
+                };
+                reader.readAsDataURL(picFile);
+            } else {
+                await finishSavingSettings();
+            }
+        }
+
+        async function finishSavingSettings() {
+            await saveUserProfileToBackend();
+            document.getElementById("my-profile-display").innerText = currentUser;
+            if (userProfilePic) {
+                document.getElementById("myAvatarDisplay").innerHTML = `<img src="${userProfilePic}">`;
+            }
+            closeSettingsModal();
+            alert("Settings saved successfully!");
+        }
+
+        async function fetchSavedContacts() {
+            try {
+                const res = await fetch(`/contacts/${encodeURIComponent(currentUser)}`);
+                const data = await res.json();
+                savedContacts = data.contacts;
+                renderContacts();
+            } catch (err) {
+                console.error("Failed to load contacts", err);
+            }
+        }
+
+        async function fetchUserGroups() {
+            try {
+                const res = await fetch(`/groups/${encodeURIComponent(currentUser)}`);
+                const data = await res.json();
+                userGroups = data.groups;
+                renderContacts();
+            } catch (err) {
+                console.error("Failed to load groups", err);
+            }
+        }
+
+        function connectWebSocket() {
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+            ws = new WebSocket(`${wsProtocol}${window.location.host}/ws/${encodeURIComponent(currentUser)}`);
+            
+            ws.onmessage = async function(event) {
                 const data = JSON.parse(event.data);
-                if (data.type === "message") {
-                    if (activeRecipient === data.sender || activeRecipient === data.recipient) {
-                        appendMessage(data);
-                    }
-                    loadContacts(); // update preview list
-                } else if (data.type === "typing") {
-                    if (activeRecipient === data.sender) {
-                        document.getElementById("typingIndicator").innerText = "typing...";
-                        clearTimeout(typingTimeout);
-                        typingTimeout = setTimeout(() => {
-                            document.getElementById("typingIndicator").innerText = "";
-                        }, 1500);
-                    }
+                
+                if (data.type === "user_list") {
+                    onlineUsers = data.users.filter(u => u !== currentUser);
+                    renderContacts();
+                } else if (data.is_group) {
+                    const gId = data.group_id;
+                    if (!chatHistories[gId]) chatHistories[gId] = [];
+                    chatHistories[gId].push({ id: data.id, sender: data.sender_id, type: data.type, content: data.message });
+                    if (activeContact === gId) renderMessages();
+                } else {
+                    const sender = data.sender_id;
+                    if (!chatHistories[sender]) chatHistories[sender] = [];
+                    chatHistories[sender].push({ id: data.id, sender: sender, type: data.type, content: data.message });
+                    
+                    if (activeContact === sender) renderMessages();
+                    renderContacts();
                 }
             };
         }
 
-        async function loadContacts() {
-            const res = await fetch(`/api/contacts?phone=${currentUser.phone}`);
-            const contacts = await res.json();
-            const container = document.getElementById("chatListContainer");
+        function renderContacts(filter = "") {
+            const container = document.getElementById("contactsListContainer");
             container.innerHTML = "";
-            contacts.forEach(c => {
+            
+            // Render Groups first
+            userGroups.forEach(grp => {
+                if (!grp.group_name.toLowerCase().includes(filter.toLowerCase())) return;
+                const isActive = activeContact === grp.group_id ? "active" : "";
                 container.innerHTML += `
-                    <div class="chat-item" onclick="selectChat('${c.contact_phone}', '${c.contact_name}')">
-                        <div class="avatar">${c.contact_name.charAt(0).toUpperCase()}</div>
-                        <div class="chat-info">
-                            <div class="top-row">
-                                <span class="name">${c.contact_name}</span>
-                            </div>
-                            <div class="preview">${c.contact_phone}</div>
+                    <div class="contact-item ${isActive}" onclick="selectGroup('${grp.group_id}', '${grp.group_name}')">
+                        <div class="contact-avatar" style="background: var(--accent-gradient);">👥</div>
+                        <div class="contact-details">
+                            <h4>${grp.group_name}</h4>
+                            <p>Group (${grp.members.length} members)</p>
+                        </div>
+                    </div>
+                `;
+            });
+
+            // Render Saved Contacts
+            const allSet = new Set([...onlineUsers, ...savedContacts]);
+            allSet.forEach(email => {
+                if (email === currentUser || !email.toLowerCase().includes(filter.toLowerCase())) return;
+                const isOnline = onlineUsers.includes(email);
+                const isActive = activeContact === email ? "active" : "";
+                const isSaved = savedContacts.includes(email);
+
+                container.innerHTML += `
+                    <div class="contact-item ${isActive}" onclick="selectContact('${email}')">
+                        <div class="contact-avatar">
+                            ${email.charAt(0).toUpperCase()}<div class="${isOnline ? 'online-dot' : 'offline-dot'}"></div>
+                        </div>
+                        <div class="contact-details">
+                            <h4>${email}</h4>
+                            <p>${isOnline ? 'Online' : 'Offline'}</p>
                         </div>
                     </div>
                 `;
             });
         }
 
-        async function selectChat(phone, name) {
-            activeRecipient = phone;
-            document.getElementById("activeChatName").innerText = name;
-            document.getElementById("activeChatAvatar").innerText = name.charAt(0).toUpperCase();
-            document.getElementById("inputArea").style.display = "flex";
-
-            const res = await fetch(`/api/messages?user1=${currentUser.phone}&user2=${phone}`);
-            const messages = await res.json();
-            const container = document.getElementById("messagesContainer");
-            container.innerHTML = "";
-            messages.forEach(m => appendMessage(m));
+        function filterContacts() {
+            renderContacts(document.getElementById("searchContactInput").value);
         }
 
-        function appendMessage(msg) {
-            const container = document.getElementById("messagesContainer");
-            const isOutgoing = msg.sender === currentUser.phone;
-            let contentHtml = msg.content;
+        async function selectContact(email) {
+            activeContact = email;
+            isGroupActive = false;
+            document.getElementById("activeChatTitle").innerText = email;
+            document.getElementById("activeChatStatus").innerText = onlineUsers.includes(email) ? "Online" : "Offline";
+            document.getElementById("activeChatAvatar").innerHTML = email.charAt(0).toUpperCase();
             
-            if (msg.msg_type === 'image') {
-                contentHtml = `<img src="${msg.file_url}" style="max-width: 200px; border-radius: 6px;"/><br>${msg.content}`;
-            } else if (msg.msg_type === 'file') {
-                contentHtml = `<a href="${msg.file_url}" target="_blank" style="color: inherit;"><i class="fa-solid fa-file"></i> Download Document</a><br>${msg.content}`;
+            document.getElementById("messageInput").disabled = false;
+            document.getElementById("app-container").classList.add("mobile-chat-open");
+            
+            const res = await fetch(`/history/${encodeURIComponent(currentUser)}/${encodeURIComponent(email)}`);
+            const data = await res.json();
+            chatHistories[email] = data.history.map(m => ({
+                id: m.id,
+                sender: m.sender === currentUser ? "You" : m.sender,
+                type: m.type,
+                content: m.content
+            }));
+            renderMessages();
+        }
+
+        async function selectGroup(groupId, groupName) {
+            activeContact = groupId;
+            isGroupActive = true;
+            document.getElementById("activeChatTitle").innerText = groupName;
+            document.getElementById("activeChatStatus").innerText = "Group Chat";
+            document.getElementById("activeChatAvatar").innerHTML = "👥";
+            
+            document.getElementById("messageInput").disabled = false;
+            document.getElementById("app-container").classList.add("mobile-chat-open");
+
+            const res = await fetch(`/group-history/${groupId}`);
+            const data = await res.json();
+            chatHistories[groupId] = data.history.map(m => ({
+                id: m.id,
+                sender: m.sender === currentUser ? "You" : m.sender,
+                type: m.type,
+                content: m.content
+            }));
+            renderMessages();
+        }
+
+        function returnToSidebar(e) {
+            e.stopPropagation();
+            document.getElementById("app-container").classList.remove("mobile-chat-open");
+            activeContact = null;
+        }
+
+        function openContactProfile() {
+            if (!activeContact || isGroupActive) return;
+            document.getElementById("modalProfileName").innerText = activeContact;
+            document.getElementById("modalProfileStatus").innerText = onlineUsers.includes(activeContact) ? "Online" : "Offline";
+            document.getElementById("modalProfileAvatar").innerHTML = activeContact.charAt(0).toUpperCase();
+            
+            const btnWrapper = document.getElementById("addToContactsBtnWrapper");
+            if (savedContacts.includes(activeContact)) {
+                btnWrapper.innerHTML = `<p style="color: #10b981; font-weight: 600; margin-bottom: 10px;">✓ Already in Contacts</p>`;
+            } else {
+                btnWrapper.innerHTML = `<button class="sel-btn" style="width: 100%; background: var(--accent-gradient); color: white; margin-bottom: 10px;" onclick="addCurrentContactPermanent()">➕ Add to Contacts</button>`;
+            }
+            document.getElementById("contact-profile-modal").classList.remove("hidden");
+        }
+
+        function closeContactProfile() {
+            document.getElementById("contact-profile-modal").classList.add("hidden");
+        }
+
+        async function addCurrentContactPermanent() {
+            if (!activeContact || savedContacts.includes(activeContact)) return;
+            await fetch("/contacts/add", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ username: currentUser, contact: activeContact })
+            });
+            savedContacts.push(activeContact);
+            closeContactProfile();
+            renderContacts();
+            alert(`${activeContact} added permanently to your contacts!`);
+        }
+
+        function openGroupModal() {
+            const listContainer = document.getElementById("groupMembersList");
+            listContainer.innerHTML = "";
+            const allSet = new Set([...onlineUsers, ...savedContacts]);
+            allSet.forEach(email => {
+                if (email === currentUser) return;
+                listContainer.innerHTML += `
+                    <label style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px; cursor: pointer; font-size: 13px;">
+                        <input type="checkbox" class="group-member-checkbox" value="${email}"> ${email}
+                    </label>
+                `;
+            });
+            document.getElementById("group-modal").classList.remove("hidden");
+        }
+
+        function closeGroupModal() {
+            document.getElementById("group-modal").classList.add("hidden");
+        }
+
+        async function createGroupSubmit() {
+            const groupName = document.getElementById("groupNameInput").value.trim();
+            const checkboxes = document.querySelectorAll(".group-member-checkbox:checked");
+            const members = Array.from(checkboxes).map(cb => cb.value);
+
+            if (!groupName || members.length === 0) {
+                alert("Please provide a group name and select at least one member.");
+                return;
             }
 
-            let reactions = JSON.parse(msg.reactions || "{}");
-            let reactionsHtml = Object.entries(reactions).map(([emoji, count]) => `<span style="background:rgba(0,0,0,0.05); padding:2px 6px; border-radius:10px; font-size:11px; margin-right:2px;">${emoji} ${count}</span>`).join('');
+            const res = await fetch("/groups/create", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ group_name: groupName, admin: currentUser, members: members })
+            });
+            const data = await res.json();
+            userGroups.push(data);
+            closeGroupModal();
+            renderContacts();
+            alert(`Group "${groupName}" created successfully!`);
+        }
 
-            container.innerHTML += `
-                <div class="message ${isOutgoing ? 'outgoing' : 'incoming'}" ondblclick="reactMessage(${msg.id})">
-                    <div>${contentHtml}</div>
-                    <div style="margin-top:4px;">${reactionsHtml}</div>
-                    <div class="meta">
-                        ${msg.timestamp} ${isOutgoing ? '<i class="fa-solid fa-check-double" style="color: #53bdeb;"></i>' : ''}
+        function renderMessages() {
+            const container = document.getElementById("chatMessagesContainer");
+            container.innerHTML = "";
+            const messages = chatHistories[activeContact] || [];
+            
+            messages.forEach(msg => {
+                const isOutgoing = msg.sender === "You" || msg.sender === currentUser;
+                let contentHTML = msg.type === "image" ? `<img src="${msg.content}" style="max-width: 220px; border-radius: 8px;">` : `<span>${msg.content}</span>`;
+                const senderLabel = isGroupActive && !isOutgoing ? `<div style="font-size: 11px; color: var(--accent); margin-bottom: 2px; font-weight: bold;">${msg.sender}</div>` : "";
+
+                container.innerHTML += `
+                    <div class="message ${isOutgoing ? "outgoing" : "incoming"}">
+                        <div class="msg-body">
+                            ${senderLabel}
+                            ${contentHTML}
+                            ${isOutgoing ? '<span class="msg-ticks">✓✓</span>' : ''}
+                        </div>
                     </div>
-                </div>
-            `;
+                `;
+            });
             container.scrollTop = container.scrollHeight;
         }
 
         function sendMessage() {
             const input = document.getElementById("messageInput");
             const text = input.value.trim();
-            if (!text || !activeRecipient) return;
+            if (!text || !activeContact) return;
 
             ws.send(JSON.stringify({
-                type: "message",
-                sender: currentUser.phone,
-                recipient: activeRecipient,
-                content: text,
-                msg_type: "text"
+                type: "chat",
+                recipient_id: activeContact,
+                message: text,
+                is_group: isGroupActive
             }));
+
+            if (!isGroupActive) {
+                if (!chatHistories[activeContact]) chatHistories[activeContact] = [];
+                chatHistories[activeContact].push({ id: Date.now(), sender: "You", type: "chat", content: text });
+                renderMessages();
+            }
             input.value = "";
         }
 
-        function sendTypingSignal() {
-            if (!activeRecipient) return;
-            ws.send(JSON.stringify({
-                type: "typing",
-                sender: currentUser.phone,
-                recipient: activeRecipient
-            }));
+        function handleKey(e) { if (e.key === "Enter") sendMessage(); }
+
+        function sendImage(e) {
+            const file = e.target.files[0];
+            if (!file || !activeContact) return;
+            const reader = new FileReader();
+            reader.onload = function() {
+                ws.send(JSON.stringify({ type: "image", recipient_id: activeContact, message: reader.result, is_group: isGroupActive }));
+                if (!isGroupActive) {
+                    if (!chatHistories[activeContact]) chatHistories[activeContact] = [];
+                    chatHistories[activeContact].push({ id: Date.now(), sender: "You", type: "image", content: reader.result });
+                    renderMessages();
+                }
+            };
+            reader.readAsDataURL(file);
         }
-
-        function handleKeyPress(e) {
-            if (e.key === 'Enter') sendMessage();
-        }
-
-        async function addContact() {
-            const phone = document.getElementById("newContactPhone").value.trim();
-            const name = document.getElementById("newContactName").value.trim();
-            await fetch('/api/contacts', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ user_phone: currentUser.phone, contact_phone: phone, contact_name: name })
-            });
-            closeModals();
-            loadContacts();
-        }
-
-        function triggerFileUpload() { document.getElementById("fileInput").click(); }
-
-        async function uploadFile(input) {
-            if (!input.files[0] || !activeRecipient) return;
-            const formData = new FormData();
-            formData.append("file", input.files[0]);
-            formData.append("sender", currentUser.phone);
-            formData.append("recipient", activeRecipient);
-
-            const res = await fetch('/api/upload', { method: 'POST', body: formData });
-            const data = await res.json();
-            ws.send(JSON.stringify({
-                type: "message",
-                sender: currentUser.phone,
-                recipient: activeRecipient,
-                content: input.files[0].name,
-                msg_type: input.files[0].type.startsWith('image') ? 'image' : 'file',
-                file_url: data.file_url
-            }));
-        }
-
-        async function reactMessage(msgId) {
-            const emoji = prompt("Choose reaction (❤️, 👍, 😂, 😮, 🙏):", "❤️");
-            if (!emoji) return;
-            await fetch('/api/react', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message_id: msgId, emoji: emoji })
-            });
-            // Refresh current chat messages
-            selectChat(activeRecipient, document.getElementById("activeChatName").innerText);
-        }
-
-        async function postStatus() {
-            const text = document.getElementById("statusTextInput").value.trim();
-            if (!text) return;
-            await fetch('/api/status', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ phone: currentUser.phone, content: text })
-            });
-            document.getElementById("statusTextInput").value = "";
-            alert("Status posted!");
-            closeModals();
-        }
-
-        async function openStatusModal() {
-            document.getElementById("statusModal").classList.remove("hidden");
-            const res = await fetch('/api/status');
-            const statuses = await res.json();
-            const feed = document.getElementById("statusFeed");
-            feed.innerHTML = statuses.map(s => `<div style="padding: 8px; border-bottom: 1px solid var(--border-color);"><b>${s.phone}:</b> ${s.content} <span style="font-size:10px; color:var(--text-secondary);">${s.timestamp}</span></div>`).join('');
-        }
-
-        function openGroupModal() { document.getElementById("groupModal").classList.remove("hidden"); }
-        function openNewContactModal() { document.getElementById("contactModal").classList.remove("hidden"); }
-        function closeModals() { document.querySelectorAll('.modal').forEach(m => m.classList.add("hidden")); }
-
-        function toggleTheme() {
-            const body = document.body;
-            body.dataset.theme = body.dataset.theme === "light" ? "dark" : "light";
-        }
-    </style>
+    </script>
 </body>
 </html>
-    """
+"""
 
-@app.post("/api/login")
-async def login(data: dict):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO users (phone, username, about) VALUES (?, ?, ?)",
-                   (data["phone"], data["username"], data["about"]))
-    conn.commit()
-    conn.close()
-    return data
+@app.get("/", response_class=HTMLResponse)
+async def get_index():
+    return HTML_CONTENT
 
-@app.get("/api/contacts")
-async def get_contacts(phone: str):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT contact_phone, contact_name FROM contacts WHERE user_phone = ?", (phone,))
-    rows = cursor.fetchall()
-    conn.close()
-    return [{"contact_phone": r[0], "contact_name": r[1]} for r in rows]
-
-@app.post("/api/contacts")
-async def add_contact(data: dict):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO contacts (user_phone, contact_phone, contact_name) VALUES (?, ?, ?)",
-                   (data["user_phone"], data["contact_phone"], data["contact_name"]))
-    conn.commit()
-    conn.close()
-    return {"status": "success"}
-
-@app.get("/api/messages")
-async def get_messages(user1: str, user2: str):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, sender, recipient, content, msg_type, file_url, reactions, timestamp 
-        FROM messages 
-        WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
-        ORDER BY id ASC
-    """, (user1, user2, user2, user1))
-    rows = cursor.fetchall()
-    conn.close()
-    return [{
-        "id": r[0], "sender": r[1], "recipient": r[2], "content": r[3],
-        "msg_type": r[4], "file_url": r[5], "reactions": r[6], "timestamp": r[7]
-    } for r in rows]
-
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...), sender: str = Form(...), recipient: str = Form(...)):
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    return {"file_url": f"/static_uploads/{file.filename}"}
-
-@app.post("/api/react")
-async def react_message(data: dict):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT reactions FROM messages WHERE id = ?", (data["message_id"],))
-    row = cursor.fetchone()
-    if row:
-        reactions = json.loads(row[0])
-        emoji = data["emoji"]
-        reactions[emoji] = reactions.get(emoji, 0) + 1
-        cursor.execute("UPDATE messages SET reactions = ? WHERE id = ?", (json.dumps(reactions), data["message_id"]))
-        conn.commit()
-    conn.close()
-    return {"status": "success"}
-
-@app.post("/api/status")
-async def post_status(data: dict):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO statuses (phone, content, timestamp) VALUES (?, ?, ?)",
-                   (data["phone"], data["content"], datetime.now().strftime("%H:%M")))
-    conn.commit()
-    conn.close()
-    return {"status": "success"}
-
-@app.get("/api/status")
-async def get_statuses():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT phone, content, timestamp FROM statuses ORDER BY id DESC LIMIT 20")
-    rows = cursor.fetchall()
-    conn.close()
-    return [{"phone": r[0], "content": r[1], "timestamp": r[2]} for r in rows]
-
-@app.websocket("/ws/{phone}")
-async def websocket_endpoint(websocket: WebSocket, phone: str):
-    await manager.connect(phone, websocket)
-    try:
-        while True:
-            data_str = await websocket.receive_text()
-            data = json.loads(data_str)
-            
-            if data["type"] == "message":
-                timestamp = datetime.now().strftime("%H:%M")
-                conn = sqlite3.connect(DB_FILE)
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO messages (sender, recipient, content, msg_type, file_url, timestamp) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (data["sender"], data["recipient"], data["content"], data.get("msg_type", "text"), data.get("file_url"), timestamp))
-                msg_id = cursor.lastrowid
-                conn.commit()
-                conn.close()
-
-                payload = {
-                    "id": msg_id,
-                    "type": "message",
-                    "sender": data["sender"],
-                    "recipient": data["recipient"],
-                    "content": data["content"],
-                    "msg_type": data.get("msg_type", "text"),
-                    "file_url": data.get("file_url"),
-                    "reactions": "{}",
-                    "timestamp": timestamp
-                }
-
-                await manager.send_personal(payload, data["recipient"])
-                await manager.send_personal(payload, data["sender"])
-                
-            elif data["type"] == "typing":
-                await manager.send_personal({"type": "typing", "sender": data["sender"]}, data["recipient"])
-
-    except WebSocketDisconnect:
-        manager.disconnect(phone)
-
-# Mount uploads directory for serving images/files
-from fastapi.staticfiles import StaticFiles
-app.mount("/static_uploads", StaticFiles(directory=UPLOAD_DIR), name="static_uploads")
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
