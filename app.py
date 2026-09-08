@@ -2,7 +2,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import json
 import sqlite3
-from typing import Dict
+from typing import Dict, List
 
 app = FastAPI(title="Metaverse_WhatsApp - Google Quantum Mobile Edition")
 
@@ -32,6 +32,30 @@ def init_db():
             owner TEXT,
             contact TEXT,
             PRIMARY KEY (owner, contact)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            admin TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS group_members (
+            group_id INTEGER,
+            username TEXT,
+            PRIMARY KEY (group_id, username)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS group_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER,
+            sender TEXT,
+            type TEXT,
+            content TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat ON messages (sender, recipient)")
@@ -65,6 +89,11 @@ class ConnectionManager:
         if recipient in self.active_connections:
             await self.active_connections[recipient].send_text(json.dumps(message))
 
+    async def broadcast_to_group(self, message: dict, members: List[str]):
+        for member in members:
+            if member in self.active_connections:
+                await self.active_connections[member].send_text(json.dumps(message))
+
 manager = ConnectionManager()
 
 @app.get("/history/{user}/{contact}")
@@ -78,9 +107,19 @@ async def get_history(user: str, contact: str):
     history = [{"id": r[0], "sender": r[1], "type": r[2], "content": r[3]} for r in rows]
     return {"history": history}
 
+@app.get("/group-history/{group_id}")
+async def get_group_history(group_id: int):
+    cursor.execute("""
+        SELECT id, sender, type, content FROM group_messages 
+        WHERE group_id = ?
+        ORDER BY id ASC
+    """, (group_id,))
+    rows = cursor.fetchall()
+    history = [{"id": r[0], "sender": r[1], "type": r[2], "content": r[3]} for r in rows]
+    return {"history": history}
+
 @app.get("/contacts/{username}")
 async def get_saved_contacts(username: str):
-    # Get explicitly saved contacts + contacts with message history
     cursor.execute("SELECT contact FROM user_contacts WHERE owner = ?", (username,))
     saved = [r[0] for r in cursor.fetchall()]
 
@@ -93,6 +132,38 @@ async def get_saved_contacts(username: str):
     
     all_contacts = list(set(saved + msg_contacts))
     return {"contacts": all_contacts, "explicit_saved": saved}
+
+@app.get("/groups/{username}")
+async def get_user_groups(username: str):
+    cursor.execute("""
+        SELECT g.id, g.name, g.admin FROM groups g
+        JOIN group_members gm ON g.id = gm.group_id
+        WHERE gm.username = ?
+    """, (username,))
+    rows = cursor.fetchall()
+    groups = []
+    for r in rows:
+        g_id = r[0]
+        cursor.execute("SELECT username FROM group_members WHERE group_id = ?", (g_id,))
+        members = [m[0] for m in cursor.fetchall()]
+        groups.append({"id": g_id, "name": r[1], "admin": r[2], "members": members})
+    return {"groups": groups}
+
+@app.post("/create-group")
+async def create_group(data: dict):
+    name = data.get("name")
+    admin = data.get("admin")
+    members = data.get("members", [])
+    if admin not in members:
+        members.append(admin)
+    
+    cursor.execute("INSERT INTO groups (name, admin) VALUES (?, ?)", (name, admin))
+    group_id = cursor.lastrowid
+    
+    for member in members:
+        cursor.execute("INSERT OR IGNORE INTO group_members (group_id, username) VALUES (?, ?)", (group_id, member))
+    db_conn.commit()
+    return {"status": "success", "group_id": group_id}
 
 @app.post("/saved-contacts")
 async def add_saved_contact(data: dict):
@@ -149,6 +220,27 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
             recipient_id = message_data.get("recipient_id")
             content = message_data.get("message")
             
+            if msg_type == "group_chat" or msg_type == "group_image" or msg_type == "group_audio":
+                group_id = message_data.get("group_id")
+                cursor.execute("INSERT INTO group_messages (group_id, sender, type, content) VALUES (?, ?, ?, ?)", 
+                               (group_id, username, msg_type.replace("group_", ""), content))
+                db_conn.commit()
+                cursor.execute("SELECT last_insert_rowid()")
+                msg_id = cursor.fetchone()[0]
+
+                cursor.execute("SELECT username FROM group_members WHERE group_id = ?", (group_id,))
+                members = [r[0] for r in cursor.fetchall()]
+
+                payload = {
+                    "id": msg_id,
+                    "type": msg_type,
+                    "group_id": group_id,
+                    "sender_id": username,
+                    "message": content
+                }
+                await manager.broadcast_to_group(payload, members)
+                continue
+
             if msg_type == "delete_message":
                 msg_id = message_data.get("message_id")
                 if msg_id:
@@ -156,15 +248,6 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     db_conn.commit()
                     payload = {"type": "delete_message", "id": msg_id, "sender_id": username}
                     await manager.send_personal_message(payload, recipient_id)
-                continue
-
-            if msg_type == "bulk_delete":
-                msg_ids = message_data.get("message_ids", [])
-                for msg_id in msg_ids:
-                    cursor.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
-                db_conn.commit()
-                payload = {"type": "bulk_delete", "ids": msg_ids, "sender_id": username}
-                await manager.send_personal_message(payload, recipient_id)
                 continue
 
             if msg_type == "clear_chat":
@@ -178,24 +261,6 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 continue
             
             if recipient_id == "Brian 🧠 (AI Archive)":
-                if msg_type == "summarize":
-                    cursor.execute("""
-                        SELECT sender, content FROM messages 
-                        WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
-                        ORDER BY id ASC
-                    """, (username, "Brian 🧠 (AI Archive)", "Brian 🧠 (AI Archive)", username))
-                    all_msgs = cursor.fetchall()
-                    summary_text = f"🧠 [Brian AI Vault Summary]: Analyzed {len(all_msgs)} interactions. Node sync is stable, memory banks fully indexed."
-                    
-                    response_payload = {
-                        "id": 999999,
-                        "type": "chat",
-                        "sender_id": "Brian 🧠 (AI Archive)",
-                        "message": summary_text
-                    }
-                    await websocket.send_text(json.dumps(response_payload))
-                    continue
-
                 cursor.execute("INSERT INTO messages (sender, recipient, type, content) VALUES (?, ?, ?, ?)", 
                                (username, "Brian 🧠 (AI Archive)", msg_type, content))
                 db_conn.commit()
@@ -263,6 +328,18 @@ HTML_CONTENT = """
             --outgoing: #059669;
         }
 
+        body.theme-light {
+            --bg-primary: #f4f6f9;
+            --bg-secondary: #ffffff;
+            --bg-panel: #e5e9f0;
+            --accent: #0284c7;
+            --accent-gradient: linear-gradient(135deg, #0284c7, #0369a1);
+            --text-main: #1f2937;
+            --text-muted: #6b7280;
+            --border: #d1d5db;
+            --outgoing: #10b981;
+        }
+
         body.theme-emerald {
             --accent: #10b981;
             --accent-gradient: linear-gradient(135deg, #10b981, #047857);
@@ -283,18 +360,22 @@ HTML_CONTENT = """
         
         /* Login Screen */
         #login-screen { position: absolute; inset: 0; background: var(--bg-primary); display: flex; justify-content: center; align-items: center; z-index: 200; padding: 15px; }
-        #login-box { background: var(--bg-panel); border: 1px solid var(--border); padding: 40px 30px; border-radius: 20px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); width: 100%; max-width: 440px; }
-        #login-box h1 { color: var(--accent); margin-bottom: 8px; font-size: 26px; font-weight: 700; }
-        #login-box p { color: var(--text-muted); font-size: 13px; margin-bottom: 25px; }
+        #login-box { background: var(--bg-panel); border: 1px solid var(--border); padding: 35px 25px; border-radius: 20px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); width: 100%; max-width: 420px; }
+        #login-box h1 { color: var(--accent); margin-bottom: 6px; font-size: 24px; font-weight: 700; }
+        #login-box p { color: var(--text-muted); font-size: 13px; margin-bottom: 20px; }
         
-        .google-btn-wrapper { display: flex; justify-content: center; margin-bottom: 20px; }
+        .login-tabs { display: flex; gap: 8px; margin-bottom: 18px; background: var(--bg-secondary); padding: 4px; border-radius: 8px; }
+        .login-tab { flex: 1; padding: 8px; font-size: 12px; font-weight: 600; background: transparent; border: none; color: var(--text-muted); cursor: pointer; border-radius: 6px; transition: 0.2s; }
+        .login-tab.active { background: var(--accent); color: var(--bg-primary); }
+
+        .google-btn-wrapper { display: flex; justify-content: center; margin-bottom: 15px; }
         
-        .divider { display: flex; align-items: center; text-align: center; color: var(--text-muted); font-size: 12px; margin: 18px 0; }
+        .divider { display: flex; align-items: center; text-align: center; color: var(--text-muted); font-size: 11px; margin: 14px 0; }
         .divider::before, .divider::after { content: ''; flex: 1; border-bottom: 1px solid var(--border); }
         .divider::before { margin-right: .5em; }
         .divider::after { margin-left: .5em; }
 
-        #login-box input { width: 100%; padding: 12px 16px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; color: white; font-size: 14px; outline: none; margin-bottom: 14px; text-align: center; }
+        #login-box input { width: 100%; padding: 12px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; color: var(--text-main); font-size: 14px; outline: none; margin-bottom: 12px; text-align: center; }
         #login-box input:focus { border-color: var(--accent); box-shadow: 0 0 10px rgba(0,242,254,0.3); }
         #login-box button.manual-login { width: 100%; padding: 12px; background: var(--accent-gradient); color: var(--bg-primary); border: none; border-radius: 10px; font-weight: bold; font-size: 14px; cursor: pointer; transition: 0.2s; }
         #login-box button.manual-login:hover { opacity: 0.9; transform: translateY(-1px); }
@@ -308,12 +389,12 @@ HTML_CONTENT = """
         .my-profile { font-weight: 600; color: var(--accent); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }
         
         .sidebar-toolbar { padding: 12px 18px; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
-        .sidebar-toolbar input { flex: 1; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: white; font-size: 13px; outline: none; }
+        .sidebar-toolbar input { flex: 1; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: var(--text-main); font-size: 13px; outline: none; }
         .sidebar-toolbar input:focus { border-color: var(--accent); }
         
         .contacts-list { flex: 1; overflow-y: auto; }
         .contact-item { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid rgba(255,255,255,0.03); cursor: pointer; transition: 0.2s; position: relative; }
-        .contact-item:hover, .contact-item.active { background: #374151; border-left: 4px solid var(--accent); }
+        .contact-item:hover, .contact-item.active { background: var(--bg-secondary); border-left: 4px solid var(--accent); }
         .contact-avatar { width: 48px; height: 48px; border-radius: 50%; background: var(--accent-gradient); color: var(--bg-primary); display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 18px; margin-right: 14px; position: relative; flex-shrink: 0; overflow: hidden; }
         .contact-avatar img { width: 100%; height: 100%; object-fit: cover; }
         .online-dot { width: 12px; height: 12px; background: #10b981; border: 2px solid var(--bg-panel); border-radius: 50%; position: absolute; bottom: 0; right: 0; z-index: 2; }
@@ -325,7 +406,7 @@ HTML_CONTENT = """
         /* Context Menu */
         #context-menu { position: absolute; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.6); z-index: 1000; display: none; padding: 6px 0; }
         .context-menu-item { padding: 10px 22px; font-size: 13px; color: #ef4444; cursor: pointer; display: flex; align-items: center; gap: 8px; }
-        .context-menu-item:hover { background: #374151; }
+        .context-menu-item:hover { background: var(--bg-secondary); }
 
         /* Chat Panel */
         .chat-panel { flex: 1; display: flex; flex-direction: column; background: var(--bg-primary); position: relative; height: 100%; }
@@ -341,7 +422,7 @@ HTML_CONTENT = """
         .call-btn:hover { border-color: var(--accent); color: var(--accent); }
         
         /* Quantum Features Bar */
-        .quantum-features-bar { background: rgba(17, 24, 39, 0.9); padding: 8px 15px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); font-size: 11px; flex-wrap: wrap; gap: 6px; }
+        .quantum-features-bar { background: var(--bg-secondary); padding: 8px 15px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); font-size: 11px; flex-wrap: wrap; gap: 6px; }
         .feature-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text-muted); font-weight: 500; }
         .feature-toggle.active { color: var(--accent); font-weight: bold; }
         
@@ -356,7 +437,7 @@ HTML_CONTENT = """
         .msg-checkbox { margin-top: 3px; accent-color: var(--accent); transform: scale(1.2); cursor: pointer; }
         .msg-body { flex: 1; }
         .msg-ticks { font-size: 11px; float: right; margin-left: 10px; margin-top: 4px; color: rgba(255,255,255,0.7); }
-        .delete-msg-btn { position: absolute; top: 6px; right: 8px; background: none; border: none; color: rgba(255,255,255,0.6); font-size: 12px; cursor: pointer; display: none; }
+        .delete-msg-btn { position: absolute; top: 6px; right: 8px; background: none; border: none; color: var(--text-muted); font-size: 12px; cursor: pointer; display: none; }
         .message:hover .delete-msg-btn { display: inline-block; }
         .delete-msg-btn:hover { color: #ef4444; }
 
@@ -368,7 +449,7 @@ HTML_CONTENT = """
 
         /* Input Area */
         .chat-input-area { min-height: 75px; background: var(--bg-secondary); padding: 12px 18px; display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border); }
-        .chat-input-area input { flex: 1; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-panel); color: white; font-size: 14px; outline: none; }
+        .chat-input-area input { flex: 1; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-panel); color: var(--text-main); font-size: 14px; outline: none; }
         .chat-input-area input:focus { border-color: var(--accent); }
         .action-btn { background: none; border: none; font-size: 20px; cursor: pointer; color: var(--text-muted); padding: 4px; transition: 0.2s; }
         .action-btn:hover { color: var(--accent); }
@@ -377,12 +458,12 @@ HTML_CONTENT = """
 
         /* Modals */
         .modal-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.8); z-index: 300; display: flex; justify-content: center; align-items: center; backdrop-filter: blur(5px); padding: 20px; }
-        .modal-content { background: var(--bg-panel); border: 1px solid var(--border); padding: 25px; border-radius: 16px; width: 100%; max-width: 400px; box-shadow: 0 15px 35px rgba(0,0,0,0.6); }
+        .modal-content { background: var(--bg-panel); border: 1px solid var(--border); padding: 25px; border-radius: 16px; width: 100%; max-width: 420px; box-shadow: 0 15px 35px rgba(0,0,0,0.6); }
         .modal-content h3 { color: var(--accent); margin-bottom: 16px; font-size: 18px; }
         .modal-content label { font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px; margin-top: 12px; }
-        .modal-content input, .modal-content textarea { width: 100%; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: white; font-size: 13px; outline: none; }
+        .modal-content input, .modal-content textarea { width: 100%; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: var(--text-main); font-size: 13px; outline: none; }
         .modal-content input:focus, .modal-content textarea:focus { border-color: var(--accent); }
-        .modal-contact-item { padding: 12px 16px; background: var(--bg-secondary); margin-bottom: 10px; border-radius: 8px; cursor: pointer; border: 1px solid var(--border); transition: 0.2s; font-size: 14px; }
+        .modal-contact-item { padding: 12px 16px; background: var(--bg-secondary); margin-bottom: 10px; border-radius: 8px; cursor: pointer; border: 1px solid var(--border); transition: 0.2s; font-size: 14px; display: flex; align-items: center; gap: 10px; }
         .modal-contact-item:hover { border-color: var(--accent); }
 
         /* Video / Audio Call Overlay */
@@ -417,35 +498,54 @@ HTML_CONTENT = """
         }
     </style>
 </head>
-<body class="theme-cyan">
+<body class="theme-dark">
 
     <div id="app-container">
-        <!-- Google Sign-In & Login Screen -->
+        <!-- Login Screen (Google, Username, & Phone + OTP) -->
         <div id="login-screen">
             <div id="login-box">
                 <h1>⚡ Metaverse</h1>
                 <p>Google Quantum Encrypted Node</p>
                 
-                <div class="google-btn-wrapper">
-                    <div id="g_id_onload"
-                         data-client_id="358332042325-3s7o118sjfv1qug4r6qlmf534083ti10.apps.googleusercontent.com"
-                         data-callback="handleGoogleLogin"
-                         data-auto_select="true"
-                         data-cookie_policy="single_host_origin">
-                    </div>
-                    <div class="g_id_signin" 
-                         data-type="standard" 
-                         data-shape="pill" 
-                         data-theme="filled_black" 
-                         data-size="large" 
-                         data-logo_alignment="left">
-                    </div>
+                <div class="login-tabs">
+                    <button class="login-tab active" id="tabUsernameBtn" onclick="switchLoginTab('username')">Username</button>
+                    <button class="login-tab" id="tabPhoneBtn" onclick="switchLoginTab('phone')">Phone OTP</button>
                 </div>
 
-                <div class="divider">or quick manual access</div>
-                
-                <input type="text" id="loginUsernameInput" placeholder="Enter custom username..." onkeypress="handleLoginKey(event)">
-                <button class="manual-login" onclick="performManualLogin()">Initialize Node Session</button>
+                <!-- Username Login Pane -->
+                <div id="usernameLoginPane">
+                    <div class="google-btn-wrapper">
+                        <div id="g_id_onload"
+                             data-client_id="YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
+                             data-callback="handleGoogleLogin"
+                             data-auto_select="false"
+                             data-cookie_policy="single_host_origin">
+                        </div>
+                        <div class="g_id_signin" 
+                             data-type="standard" 
+                             data-shape="pill" 
+                             data-theme="filled_black" 
+                             data-size="large" 
+                             data-logo_alignment="left">
+                        </div>
+                    </div>
+                    <div class="divider">or quick manual access</div>
+                    <input type="text" id="loginUsernameInput" placeholder="Enter custom username..." onkeypress="handleLoginKey(event)">
+                    <button class="manual-login" onclick="performManualLogin()">Initialize Node Session</button>
+                </div>
+
+                <!-- Phone OTP Login Pane -->
+                <div id="phoneLoginPane" class="hidden">
+                    <div id="phoneStep1">
+                        <input type="tel" id="loginPhoneInput" placeholder="Enter phone number (e.g. +1...)" style="margin-bottom: 10px;">
+                        <button class="manual-login" onclick="sendOtpCode()">Send SMS OTP</button>
+                    </div>
+                    <div id="phoneStep2" class="hidden">
+                        <p style="font-size: 12px; color: var(--accent); margin-bottom: 10px;" id="otpInfoText">OTP sent via SMS!</p>
+                        <input type="text" id="loginOtpInput" placeholder="Enter 4-digit OTP code..." maxlength="4" style="letter-spacing: 4px; font-size: 18px;">
+                        <button class="manual-login" onclick="verifyOtpCode()">Verify & Login</button>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -457,17 +557,18 @@ HTML_CONTENT = """
                     <div class="my-profile" id="my-profile-display">Node</div>
                 </div>
                 <div style="display: flex; gap: 6px;">
+                    <button class="header-btn" onclick="openCreateGroupModal()" title="Create Group">👥</button>
                     <button class="header-btn" onclick="openSettingsModal()" title="Settings">⚙️</button>
                     <button class="header-btn" onclick="logout()" title="Logout" style="font-size: 11px; padding: 5px 8px;">Logout</button>
                 </div>
             </div>
             <div class="sidebar-toolbar">
-                <input type="text" id="searchContactInput" placeholder="Search contacts..." oninput="filterContacts()">
+                <input type="text" id="searchContactInput" placeholder="Search chats & groups..." oninput="filterContacts()">
             </div>
             <div class="contacts-list" id="contactsListContainer"></div>
         </div>
 
-        <!-- Context Menu for Right Click / Long Press -->
+        <!-- Context Menu -->
         <div id="context-menu">
             <div class="context-menu-item" onclick="clearChatAction()">🗑️ Clear Chat History</div>
         </div>
@@ -498,7 +599,8 @@ HTML_CONTENT = """
                     <span class="feature-toggle" onclick="requestAiSummary()">🧠 AI Summarize</span>
                 </div>
                 <div style="display: flex; gap: 8px;">
-                    <span style="cursor:pointer; color: #00f2fe;" onclick="setTheme('cyan')" title="Cyber Cyan">🔵</span>
+                    <span style="cursor:pointer; color: #1f2937; background: #fff; border-radius:50%; padding:2px;" onclick="setTheme('light')" title="Light Mode">☀️</span>
+                    <span style="cursor:pointer; color: #080c14; background: #00f2fe; border-radius:50%; padding:2px;" onclick="setTheme('dark')" title="Dark Mode">🌙</span>
                     <span style="cursor:pointer; color: #10b981;" onclick="setTheme('emerald')" title="Matrix Emerald">🟢</span>
                     <span style="cursor:pointer; color: #8b5cf6;" onclick="setTheme('violet')" title="Midnight Violet">🟣</span>
                 </div>
@@ -536,7 +638,7 @@ HTML_CONTENT = """
                 <label>Profile Picture</label>
                 <div style="display: flex; align-items: center; gap: 12px; margin-top: 6px;">
                     <div class="profile-avatar-sm" id="settingsAvatarPreviewBox" style="width: 50px; height: 50px; font-size: 20px;">⚡</div>
-                    <input type="file" id="settingsAvatarFile" accept="image/*" style="font-size: 12px; padding: 6px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: white;" onchange="previewAvatar(event)">
+                    <input type="file" id="settingsAvatarFile" accept="image/*" style="font-size: 12px; padding: 6px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: var(--text-main);" onchange="previewAvatar(event)">
                 </div>
 
                 <label>Display Name</label>
@@ -545,16 +647,31 @@ HTML_CONTENT = """
                 <label>About / Status</label>
                 <textarea id="settingsStatusInput" rows="2" placeholder="Hey there! I am using Metaverse WhatsApp..."></textarea>
                 
-                <label>Theme Color</label>
+                <label>Theme Mode</label>
                 <div style="display: flex; gap: 10px; margin-top: 6px; margin-bottom: 20px;">
-                    <button class="sel-btn" onclick="setTheme('cyan')" style="background: #00f2fe; color: black; flex: 1;">Cyan</button>
+                    <button class="sel-btn" onclick="setTheme('light')" style="background: #ffffff; color: black; flex: 1;">Light</button>
+                    <button class="sel-btn" onclick="setTheme('dark')" style="background: #111827; color: white; flex: 1;">Dark</button>
                     <button class="sel-btn" onclick="setTheme('emerald')" style="background: #10b981; color: white; flex: 1;">Emerald</button>
-                    <button class="sel-btn" onclick="setTheme('violet')" style="background: #8b5cf6; color: white; flex: 1;">Violet</button>
                 </div>
 
                 <div style="display: flex; gap: 10px;">
-                    <button class="sel-btn" style="flex: 1; background: var(--accent-gradient); color: black;" onclick="saveSettings()">Save Settings</button>
+                    <button class="sel-btn" style="flex: 1; background: var(--accent-gradient); color: var(--bg-primary);" onclick="saveSettings()">Save Settings</button>
                     <button class="sel-btn" style="flex: 1; background: var(--bg-secondary);" onclick="closeSettingsModal()">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Create Group Modal -->
+        <div id="create-group-modal" class="modal-overlay hidden">
+            <div class="modal-content">
+                <h3>👥 Create New Group</h3>
+                <label>Group Name</label>
+                <input type="text" id="newGroupNameInput" placeholder="Enter group name...">
+                <label>Select Members</label>
+                <div id="groupMembersSelectionList" style="max-height: 180px; overflow-y: auto; margin: 10px 0; border: 1px solid var(--border); border-radius: 8px; padding: 8px; background: var(--bg-secondary);"></div>
+                <div style="display: flex; gap: 10px; margin-top: 15px;">
+                    <button class="sel-btn" style="flex: 1; background: var(--accent-gradient); color: var(--bg-primary);" onclick="submitCreateGroup()">Create Group</button>
+                    <button class="sel-btn" style="flex: 1; background: var(--bg-secondary);" onclick="closeCreateGroupModal()">Cancel</button>
                 </div>
             </div>
         </div>
@@ -597,13 +714,17 @@ HTML_CONTENT = """
         let onlineUsers = [];
         let allContacts = [];
         let explicitSavedContacts = [];
+        let userGroups = [];
         let activeContact = null;
+        let activeGroup = null;
         let chatHistories = {};
+        let groupHistories = {};
         
         let isSelectMode = false;
         let selectedMessageIds = new Set();
         let contextTargetContact = null;
         let ghostModeActive = false;
+        let generatedOtpCode = null;
 
         let mediaRecorder, audioChunks = [], isRecording = false;
         let localStream, peerConnection;
@@ -611,7 +732,7 @@ HTML_CONTENT = """
         const servers = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
         window.onload = function() {
-            const savedTheme = localStorage.getItem("metaverse_theme") || "cyan";
+            const savedTheme = localStorage.getItem("metaverse_theme") || "dark";
             setTheme(savedTheme, false);
 
             if (currentUser) {
@@ -623,6 +744,36 @@ HTML_CONTENT = """
             });
         };
 
+        function switchLoginTab(tab) {
+            document.getElementById("tabUsernameBtn").classList.toggle("active", tab === "username");
+            document.getElementById("tabPhoneBtn").classList.toggle("active", tab === "phone");
+            document.getElementById("usernameLoginPane").classList.toggle("hidden", tab !== "username");
+            document.getElementById("phoneLoginPane").classList.toggle("hidden", tab !== "phone");
+        }
+
+        function sendOtpCode() {
+            const phone = document.getElementById("loginPhoneInput").value.trim();
+            if (!phone || phone.length < 7) {
+                alert("Please enter a valid phone number.");
+                return;
+            }
+            generatedOtpCode = Math.floor(1000 + Math.random() * 9000).toString();
+            document.getElementById("otpInfoText.innerHTML") = `📱 [Simulated SMS Sent]: Your OTP is <b>${generatedOtpCode}</b>`;
+            alert(`📱 [Simulated SMS]: Your Metaverse OTP is ${generatedOtpCode}`);
+            document.getElementById("phoneStep1").classList.add("hidden");
+            document.getElementById("phoneStep2").classList.remove("hidden");
+        }
+
+        function verifyOtpCode() {
+            const entered = document.getElementById("loginOtpInput").value.trim();
+            if (entered === generatedOtpCode) {
+                const phone = document.getElementById("loginPhoneInput").value.trim();
+                initializeUserSession(`📱 User_${phone}`);
+            } else {
+                alert("Incorrect OTP code. Please try again.");
+            }
+        }
+
         function handleGoogleLogin(response) {
             try {
                 const base64Url = response.credential.split('.')[1];
@@ -632,11 +783,7 @@ HTML_CONTENT = """
                 }).join(''));
                 
                 const payload = JSON.parse(jsonPayload);
-                const userEmail = payload.email;
-                
-                if (userEmail) {
-                    initializeUserSession(userEmail);
-                }
+                if (payload.email) initializeUserSession(payload.email);
             } catch (err) {
                 console.error("Google authentication parsing failed", err);
                 alert("Google Sign-In verification error.");
@@ -648,7 +795,7 @@ HTML_CONTENT = """
         function performManualLogin() {
             const inputVal = document.getElementById("loginUsernameInput").value.trim();
             if (!inputVal) {
-                alert("Please enter a valid username or sign in with Google.");
+                alert("Please enter a valid username.");
                 return;
             }
             initializeUserSession(inputVal);
@@ -662,6 +809,7 @@ HTML_CONTENT = """
             document.getElementById("login-screen").classList.add("hidden");
             connectWebSocket();
             await fetchSavedContacts();
+            await fetchUserGroups();
         }
 
         async function loadUserProfile() {
@@ -734,9 +882,7 @@ HTML_CONTENT = """
                 currentUser = newName;
                 localStorage.setItem("metaverse_user", currentUser);
             }
-            if (newStatus) {
-                userStatus = newStatus;
-            }
+            if (newStatus) userStatus = newStatus;
 
             try {
                 await fetch('/profile', {
@@ -751,6 +897,66 @@ HTML_CONTENT = """
             updateProfileDisplay();
             closeSettingsModal();
             alert("Settings and profile updated successfully!");
+        }
+
+        function openCreateGroupModal() {
+            document.getElementById("newGroupNameInput").value = "";
+            const listContainer = document.getElementById("groupMembersSelectionList");
+            listContainer.innerHTML = "";
+
+            const fullContactSet = new Set([...onlineUsers, ...allContacts]);
+            fullContactSet.forEach(email => {
+                if (email === currentUser || email === "Brian 🧠 (AI Archive)") return;
+                listContainer.innerHTML += `
+                    <label style="display:flex; align-items:center; gap:8px; margin-bottom:6px; cursor:pointer; font-size:13px;">
+                        <input type="checkbox" value="${email}" class="group-member-checkbox"> 👤 ${email}
+                    </label>
+                `;
+            });
+
+            document.getElementById("create-group-modal").classList.remove("hidden");
+        }
+
+        function closeCreateGroupModal() {
+            document.getElementById("create-group-modal").classList.add("hidden");
+        }
+
+        async function submitCreateGroup() {
+            const groupName = document.getElementById("newGroupNameInput").value.trim();
+            if (!groupName) {
+                alert("Please enter a group name.");
+                return;
+            }
+
+            const checkboxes = document.querySelectorAll(".group-member-checkbox:checked");
+            const members = Array.from(checkboxes).map(cb => cb.value);
+
+            try {
+                const res = await fetch('/create-group', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: groupName, admin: currentUser, members: members })
+                });
+                const data = await res.json();
+                if (data.status === "success") {
+                    closeCreateGroupModal();
+                    await fetchUserGroups();
+                    alert(`Group "${groupName}" created successfully!`);
+                }
+            } catch (err) {
+                console.error("Group creation failed", err);
+            }
+        }
+
+        async function fetchUserGroups() {
+            try {
+                const res = await fetch(`/groups/${encodeURIComponent(currentUser)}`);
+                const data = await res.json();
+                userGroups = data.groups;
+                renderContacts();
+            } catch (err) {
+                console.error("Failed to load groups", err);
+            }
         }
 
         function toggleGhostMode() {
@@ -795,12 +1001,8 @@ HTML_CONTENT = """
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ owner: currentUser, contact: activeContact })
                 });
-                if (!explicitSavedContacts.includes(activeContact)) {
-                    explicitSavedContacts.push(activeContact);
-                }
-                if (!allContacts.includes(activeContact)) {
-                    allContacts.push(activeContact);
-                }
+                if (!explicitSavedContacts.includes(activeContact)) explicitSavedContacts.push(activeContact);
+                if (!allContacts.includes(activeContact)) allContacts.push(activeContact);
                 document.getElementById("addContactHeaderBtn").classList.add("hidden");
                 renderContacts();
                 alert(`${activeContact} permanently added to your contacts!`);
@@ -819,14 +1021,19 @@ HTML_CONTENT = """
                 if (data.type === "user_list") {
                     onlineUsers = data.users.filter(u => u !== currentUser);
                     renderContacts();
+                } else if (data.type === "group_chat" || data.type === "group_image") {
+                    const gId = data.group_id;
+                    if (!groupHistories[gId]) groupHistories[gId] = [];
+                    groupHistories[gId].push({
+                        id: data.id,
+                        sender: data.sender_id === currentUser ? "You" : data.sender_id,
+                        type: data.type.replace("group_", ""),
+                        content: data.message
+                    });
+                    if (activeGroup && activeGroup.id === gId) renderMessages();
                 } else if (data.type === "delete_message") {
                     for (let contactKey in chatHistories) {
                         chatHistories[contactKey] = chatHistories[contactKey].filter(m => m.id !== data.id);
-                    }
-                    renderMessages();
-                } else if (data.type === "bulk_delete") {
-                    for (let contactKey in chatHistories) {
-                        chatHistories[contactKey] = chatHistories[contactKey].filter(m => !data.ids.includes(m.id));
                     }
                     renderMessages();
                 } else if (data.type === "clear_chat") {
@@ -864,6 +1071,24 @@ HTML_CONTENT = """
             const container = document.getElementById("contactsListContainer");
             container.innerHTML = "";
             
+            // Render Groups first
+            userGroups.forEach(g => {
+                if (!g.name.toLowerCase().includes(filter.toLowerCase())) return;
+                const isActive = activeGroup && activeGroup.id === g.id ? "active" : "";
+                const groupDiv = document.createElement("div");
+                groupDiv.className = `contact-item ${isActive}`;
+                groupDiv.onclick = () => selectGroup(g);
+                groupDiv.innerHTML = `
+                    <div class="contact-avatar" style="background: var(--accent-gradient);">👥</div>
+                    <div class="contacts-details" style="flex:1; overflow:hidden;">
+                        <h4 style="font-size: 15px; color: var(--text-main); font-weight: 500;">${g.name}</h4>
+                        <p style="font-size: 12px; color: var(--accent); margin-top: 3px;">Group (${g.members.length} members)</p>
+                    </div>
+                `;
+                container.appendChild(groupDiv);
+            });
+
+            // Render Contacts & Brian
             const fullContactSet = new Set([...onlineUsers, ...allContacts, "Brian 🧠 (AI Archive)"]);
             
             fullContactSet.forEach(email => {
@@ -912,8 +1137,48 @@ HTML_CONTENT = """
             renderContacts(query);
         }
 
+        async function selectGroup(group) {
+            activeGroup = group;
+            activeContact = null;
+            isSelectMode = false;
+            selectedMessageIds.clear();
+            document.getElementById("selection-action-bar").classList.add("hidden");
+            document.getElementById("selectModeBtn").classList.remove("active-mode");
+
+            document.getElementById("activeChatTitle").innerText = group.name;
+            document.getElementById("activeChatStatus").innerText = `Group • Members: ${group.members.join(', ')}`;
+            document.getElementById("activeChatAvatar").innerText = "👥";
+            
+            document.getElementById("messageInput").disabled = false;
+            document.getElementById("micBtn").disabled = false;
+            document.getElementById("selectModeBtn").classList.add("hidden");
+            document.getElementById("addContactHeaderBtn").classList.add("hidden");
+            document.getElementById("quantumFeaturesBar").classList.remove("hidden");
+            document.getElementById("videoCallBtn").classList.add("hidden");
+            document.getElementById("audioCallBtn").classList.add("hidden");
+
+            document.getElementById("app-container").classList.add("mobile-chat-open");
+
+            try {
+                const res = await fetch(`/group-history/${group.id}`);
+                const data = await res.json();
+                groupHistories[group.id] = data.history.map(m => ({
+                    id: m.id,
+                    sender: m.sender === currentUser ? "You" : m.sender,
+                    type: m.type,
+                    content: m.content
+                }));
+            } catch (err) {
+                console.error("Group history sync error", err);
+            }
+
+            renderContacts();
+            renderMessages();
+        }
+
         async function selectContact(email) {
             activeContact = email;
+            activeGroup = null;
             isSelectMode = false;
             selectedMessageIds.clear();
             document.getElementById("selection-action-bar").classList.add("hidden");
@@ -964,6 +1229,7 @@ HTML_CONTENT = """
         function returnToSidebar() {
             document.getElementById("app-container").classList.remove("mobile-chat-open");
             activeContact = null;
+            activeGroup = null;
             renderContacts();
         }
 
@@ -1011,7 +1277,8 @@ HTML_CONTENT = """
         function renderMessages() {
             const container = document.getElementById("chatMessagesContainer");
             container.innerHTML = "";
-            const messages = chatHistories[activeContact] || [];
+            
+            const messages = activeGroup ? (groupHistories[activeGroup.id] || []) : (chatHistories[activeContact] || []);
             
             messages.forEach(msg => {
                 const isOutgoing = msg.sender === "You";
@@ -1025,6 +1292,7 @@ HTML_CONTENT = """
                     contentHTML = `<img src="${msg.content}" style="max-width: 220px; border-radius: 8px; display: block; margin-bottom: 4px;">`;
                 }
 
+                const senderLabel = (activeGroup && !isOutgoing) ? `<div style="font-size: 11px; font-weight: bold; color: var(--accent); margin-bottom: 2px;">${msg.sender}</div>` : "";
                 const ticksHTML = isOutgoing ? `<span class="msg-ticks">✓✓</span>` : "";
                 const checkboxHTML = isSelectMode ? `<input type="checkbox" class="msg-checkbox" onchange="handleMessageCheckbox(${msg.id}, this)" ${selectedMessageIds.has(msg.id) ? 'checked' : ''}>` : "";
 
@@ -1032,120 +1300,38 @@ HTML_CONTENT = """
                     <div class="message ${isOutgoing ? "outgoing" : "incoming"}">
                         ${checkboxHTML}
                         <div class="msg-body">
+                            ${senderLabel}
                             ${contentHTML}
                             ${ticksHTML}
                         </div>
-                        ${!isSelectMode ? `<button class="delete-msg-btn" onclick="deleteMessage('${activeContact}', ${msg.id})">🗑️</button>` : ""}
                     </div>
                 `;
             });
             container.scrollTop = container.scrollHeight;
         }
 
-        async function deleteMessage(contact, msgId) {
-            ws.send(JSON.stringify({ type: "delete_message", recipient_id: contact, message_id: msgId }));
-
-            try {
-                await fetch(`/message/${msgId}`, { method: 'DELETE' });
-            } catch (err) {
-                console.error("Delete sync error", err);
-            }
-
-            if (chatHistories[contact]) {
-                chatHistories[contact] = chatHistories[contact].filter(m => m.id !== msgId);
-                renderMessages();
-            }
-        }
-
-        async function deleteSelectedMessages() {
-            if (selectedMessageIds.size === 0) return;
-            const idsArray = Array.from(selectedMessageIds);
-
-            ws.send(JSON.stringify({ type: "bulk_delete", recipient_id: activeContact, message_ids: idsArray }));
-
-            for (let msgId of idsArray) {
-                try {
-                    await fetch(`/message/${msgId}`, { method: 'DELETE' });
-                } catch (err) {
-                    console.error("Bulk delete error", err);
-                }
-            }
-
-            if (chatHistories[activeContact]) {
-                chatHistories[activeContact] = chatHistories[activeContact].filter(m => !selectedMessageIds.has(m.id));
-            }
-            toggleSelectMode();
-            renderMessages();
-        }
-
-        function openForwardModal() {
-            if (selectedMessageIds.size === 0) {
-                alert("Please select messages to forward.");
-                return;
-            }
-            const modalList = document.getElementById("modalContactsList");
-            modalList.innerHTML = "";
-
-            const fullContactSet = new Set([...onlineUsers, ...allContacts]);
-            fullContactSet.forEach(email => {
-                if (email === currentUser || email === "Brian 🧠 (AI Archive)") return;
-                modalList.innerHTML += `
-                    <div class="modal-contact-item" onclick="forwardSelectedTo('${email}')">
-                        ➡️ ${email}
-                    </div>
-                `;
-            });
-
-            document.getElementById("forward-modal").classList.remove("hidden");
-        }
-
-        function closeForwardModal() {
-            document.getElementById("forward-modal").classList.add("hidden");
-        }
-
-        async function forwardSelectedTo(targetContact) {
-            const messagesToForward = (chatHistories[activeContact] || []).filter(m => selectedMessageIds.has(m.id));
-            
-            for (let msg of messagesToForward) {
-                ws.send(JSON.stringify({ type: msg.type, recipient_id: targetContact, message: msg.content }));
-            }
-
-            closeForwardModal();
-            toggleSelectMode();
-            alert(`Forwarded ${messagesToForward.length} message(s) to ${targetContact}!`);
-        }
-
         function sendMessage() {
             const input = document.getElementById("messageInput");
             const text = input.value.trim();
-            if (!text || !activeContact) return;
+            if (!text) return;
 
-            ws.send(JSON.stringify({ type: "chat", recipient_id: activeContact, message: text }));
+            if (activeGroup) {
+                ws.send(JSON.stringify({ type: "group_chat", group_id: activeGroup.id, message: text }));
+            } else if (activeContact) {
+                ws.send(JSON.stringify({ type: "chat", recipient_id: activeContact, message: text }));
 
-            const localMsgId = Date.now();
-            const msgObj = {
-                id: localMsgId,
-                sender: "You",
-                type: "chat",
-                content: text
-            };
+                const localMsgId = Date.now();
+                const msgObj = { id: localMsgId, sender: "You", type: "chat", content: text };
 
-            if (!chatHistories[activeContact]) chatHistories[activeContact] = [];
-            chatHistories[activeContact].push(msgObj);
-            
-            if (!allContacts.includes(activeContact) && activeContact !== "Brian 🧠 (AI Archive)") {
-                allContacts.push(activeContact);
+                if (!chatHistories[activeContact]) chatHistories[activeContact] = [];
+                chatHistories[activeContact].push(msgObj);
+                
+                if (!allContacts.includes(activeContact) && activeContact !== "Brian 🧠 (AI Archive)") {
+                    allContacts.push(activeContact);
+                }
+                renderMessages();
+                renderContacts();
             }
-
-            if (ghostModeActive) {
-                setTimeout(() => {
-                    chatHistories[activeContact] = chatHistories[activeContact].filter(m => m.id !== localMsgId);
-                    renderMessages();
-                }, 30000);
-            }
-
-            renderMessages();
-            renderContacts();
             input.value = "";
         }
 
@@ -1153,31 +1339,27 @@ HTML_CONTENT = """
 
         function sendImage(event) {
             const file = event.target.files[0];
-            if (!file || !activeContact) return;
+            if (!file) return;
 
             const reader = new FileReader();
             reader.onload = function() {
                 const imageUrl = reader.result;
-                ws.send(JSON.stringify({ type: "image", recipient_id: activeContact, message: imageUrl }));
-
-                const localMsgId = Date.now();
-                const msgObj = {
-                    id: localMsgId,
-                    sender: "You",
-                    type: "image",
-                    content: imageUrl
-                };
-
-                if (!chatHistories[activeContact]) chatHistories[activeContact] = [];
-                chatHistories[activeContact].push(msgObj);
-                renderMessages();
+                if (activeGroup) {
+                    ws.send(JSON.stringify({ type: "group_image", group_id: activeGroup.id, message: imageUrl }));
+                } else if (activeContact) {
+                    ws.send(JSON.stringify({ type: "image", recipient_id: activeContact, message: imageUrl }));
+                    const msgObj = { id: Date.now(), sender: "You", type: "image", content: imageUrl };
+                    if (!chatHistories[activeContact]) chatHistories[activeContact] = [];
+                    chatHistories[activeContact].push(msgObj);
+                    renderMessages();
+                }
             };
             reader.readAsDataURL(file);
         }
 
         async function toggleRecordVoice() {
             const micBtn = document.getElementById("micBtn");
-            if (!activeContact) return;
+            if (!activeContact && !activeGroup) return;
 
             if (!isRecording) {
                 try {
@@ -1191,18 +1373,13 @@ HTML_CONTENT = """
                         reader.readAsDataURL(new Blob(audioChunks, { type: 'audio/webm' }));
                         reader.onloadend = () => {
                             const audioUrl = reader.result;
-                            ws.send(JSON.stringify({ type: "audio_note", recipient_id: activeContact, message: audioUrl }));
-
-                            const msgObj = {
-                                id: Date.now(),
-                                sender: "You",
-                                type: "audio_note",
-                                content: audioUrl
-                            };
-
-                            if (!chatHistories[activeContact]) chatHistories[activeContact] = [];
-                            chatHistories[activeContact].push(msgObj);
-                            renderMessages();
+                            if (activeContact) {
+                                ws.send(JSON.stringify({ type: "audio_note", recipient_id: activeContact, message: audioUrl }));
+                                const msgObj = { id: Date.now(), sender: "You", type: "audio_note", content: audioUrl };
+                                if (!chatHistories[activeContact]) chatHistories[activeContact] = [];
+                                chatHistories[activeContact].push(msgObj);
+                                renderMessages();
+                            }
                         };
                     };
 
