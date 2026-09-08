@@ -349,7 +349,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 if row:
                     payload = {
                         "id": msg_id, "group_id": recipient_id, "type": msg_type,
-                        "sender_id": username, "message": content, "is_group": True,
+                        "sender_id": username, "content": content, "is_group": True,
                         "view_once": view_once, "is_edited": 0, "is_pinned": 0, "reactions": {}
                     }
                     await manager.broadcast_to_group(recipient_id, payload, json.loads(row[0]))
@@ -363,10 +363,9 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 msg_id = cursor.fetchone()[0]
 
                 payload = {
-                    "id": msg_id, "type": msg_type, "sender_id": username, "message": content,
+                    "id": msg_id, "type": msg_type, "sender_id": username, "content": content,
                     "view_once": view_once, "is_edited": 0, "is_pinned": 0, "reactions": {}
                 }
-                # Send to recipient AND back to sender so it appears on screen immediately
                 await manager.send_personal_message(payload, recipient_id)
                 await manager.send_personal_message(payload, username)
                 
@@ -512,7 +511,6 @@ HTML_CONTENT = """
                 <h1>⚡ Metaverse</h1>
                 <p>Permanent Storage & Google Sign-In</p>
                 
-                <!-- Google Sign-In Button -->
                 <div id="g_id_onload"
                      data-client_id="358332042325-3s7o118sjfv1qug4r6qlmf534083ti10.apps.googleusercontent.com"
                      data-callback="handleGoogleLogin"
@@ -937,9 +935,23 @@ HTML_CONTENT = """
         async function selectContact(email) {
             activeContact = email;
             isGroupActive = false;
+            
+            let contactAvatarHtml = email.charAt(0).toUpperCase();
+            let contactStatusText = onlineUsers.includes(email) ? "Online" : "Offline";
+            try {
+                const resUser = await fetch(`/user/${encodeURIComponent(email)}`);
+                const userData = await resUser.json();
+                if (userData.profile_pic) {
+                    contactAvatarHtml = `<img src="${userData.profile_pic}">`;
+                }
+                if (userData.status) {
+                    contactStatusText = userData.status;
+                }
+            } catch(e) {}
+
             document.getElementById("activeChatTitle").innerText = email;
-            document.getElementById("activeChatStatus").innerText = onlineUsers.includes(email) ? "Online" : "Offline";
-            document.getElementById("activeChatAvatar").innerHTML = email.charAt(0).toUpperCase();
+            document.getElementById("activeChatStatus").innerText = contactStatusText;
+            document.getElementById("activeChatAvatar").innerHTML = contactAvatarHtml;
             document.getElementById("messageInput").disabled = false;
             document.getElementById("app-container").classList.add("mobile-chat-open");
             
@@ -972,11 +984,20 @@ HTML_CONTENT = """
             activeContact = null;
         }
 
-        function openContactProfile() {
+        async function openContactProfile() {
             if (!activeContact || isGroupActive) return;
+            let avatarHtml = activeContact.charAt(0).toUpperCase();
+            let statusText = onlineUsers.includes(activeContact) ? "Online" : "Offline";
+            try {
+                const res = await fetch(`/user/${encodeURIComponent(activeContact)}`);
+                const data = await res.json();
+                if (data.profile_pic) avatarHtml = `<img src="${data.profile_pic}">`;
+                if (data.status) statusText = data.status;
+            } catch(e) {}
+
             document.getElementById("modalProfileName").innerText = activeContact;
-            document.getElementById("modalProfileStatus").innerText = onlineUsers.includes(activeContact) ? "Online" : "Offline";
-            document.getElementById("modalProfileAvatar").innerHTML = activeContact.charAt(0).toUpperCase();
+            document.getElementById("modalProfileStatus").innerText = statusText;
+            document.getElementById("modalProfileAvatar").innerHTML = avatarHtml;
             
             const btnWrapper = document.getElementById("addToContactsBtnWrapper");
             if (savedContacts.includes(activeContact)) {
@@ -1204,7 +1225,6 @@ HTML_CONTENT = """
                 `;
             });
 
-            // Render active polls
             Object.values(activePolls).forEach(poll => {
                 let totalVotes = Object.values(poll.votes).reduce((a, b) => a + b.length, 0);
                 let optionsHtml = "";
