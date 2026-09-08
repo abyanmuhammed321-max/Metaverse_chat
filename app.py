@@ -354,7 +354,8 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     }
                     await manager.broadcast_to_group(recipient_id, payload, json.loads(row[0]))
                 continue
-if msg_type in ["chat", "audio_note", "image"]:
+
+            if msg_type in ["chat", "audio_note", "image"]:
                 cursor.execute("INSERT INTO messages (sender, recipient, type, content, view_once) VALUES (?, ?, ?, ?, ?)", 
                                (username, recipient_id, msg_type, content, view_once))
                 db_conn.commit()
@@ -366,8 +367,7 @@ if msg_type in ["chat", "audio_note", "image"]:
                     "view_once": view_once, "is_edited": 0, "is_pinned": 0, "reactions": {}
                 }
                 await manager.send_personal_message(payload, recipient_id)
-                await manager.send_personal_message(payload, username)  # <-- Add this line to echo it back to yourself
-                continue
+                await manager.send_personal_message(payload, username)
                 
     except WebSocketDisconnect:
         manager.disconnect(username)
@@ -519,7 +519,7 @@ HTML_CONTENT = """
                 
                 <!-- Google Sign In Button Container -->
                 <div id="g_id_onload"
-                     data-client_id="358332042325-3s7o118sjfv1qug4r6qlmf534083ti10.apps.googleusercontent.com"
+                     data-client_id="YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
                      data-callback="handleGoogleCredentialResponse"
                      data-auto_prompt="false">
                 </div>
