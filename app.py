@@ -4,9 +4,22 @@ from pydantic import BaseModel
 import json
 import sqlite3
 import uuid
+import asyncio
+import os
+import re
+from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
+try:
+    from google.oauth2 import id_token
+    from google.auth.transport import requests as google_requests
+    GOOGLE_AUTH_AVAILABLE = True
+except ImportError:
+    GOOGLE_AUTH_AVAILABLE = False
+
 app = FastAPI(title="Metaverse_WhatsApp - Multimedia Edition")
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com")
 
 # ==================== DATABASE SETUP ====================
 def init_db():
@@ -28,6 +41,14 @@ def init_db():
             status TEXT,
             profile_pic TEXT,
             theme TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS google_accounts (
+            google_sub TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
     cursor.execute("""
@@ -59,7 +80,15 @@ def init_db():
     return conn
 
 db_conn = init_db()
-cursor = db_conn.cursor()
+db_lock = asyncio.Lock()
+
+@asynccontextmanager
+async def db_transaction():
+    """Serialize SQLite access because FastAPI WebSockets can run concurrently."""
+    async with db_lock:
+        yield db_conn.cursor()
+        db_conn.commit()
+
 
 # ==================== WEBSOCKET CONNECTION MANAGER ====================
 class ConnectionManager:
@@ -78,12 +107,25 @@ class ConnectionManager:
     async def broadcast_user_list(self):
         user_list = list(self.active_connections.keys())
         payload = {"type": "user_list", "users": user_list}
-        for connection in self.active_connections.values():
-            await connection.send_text(json.dumps(payload))
+        dead = []
+        for username, connection in list(self.active_connections.items()):
+            try:
+                await connection.send_text(json.dumps(payload))
+            except Exception:
+                dead.append(username)
+        for username in dead:
+            self.disconnect(username)
 
     async def send_personal_message(self, message: dict, recipient: str):
-        if recipient in self.active_connections:
-            await self.active_connections[recipient].send_text(json.dumps(message))
+        connection = self.active_connections.get(recipient)
+        if not connection:
+            return False
+        try:
+            await connection.send_text(json.dumps(message))
+            return True
+        except Exception:
+            self.disconnect(recipient)
+            return False
 
     async def broadcast_to_group(self, group_id: str, message: dict, members: list):
         for member in members:
@@ -102,25 +144,111 @@ class UserProfile(BaseModel):
 
 @app.post("/user/update")
 async def update_user(profile: UserProfile):
-    cursor.execute("""
-        INSERT INTO users (username, status, profile_pic, theme) 
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(username) DO UPDATE SET 
-            status = COALESCE(?, status),
-            profile_pic = COALESCE(?, profile_pic),
-            theme = COALESCE(?, theme)
-    """, (profile.username, profile.status, profile.profile_pic, profile.theme,
-          profile.status, profile.profile_pic, profile.theme))
-    db_conn.commit()
+    async with db_transaction() as cursor:
+        cursor.execute("""
+            INSERT INTO users (username, status, profile_pic, theme)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                status = COALESCE(?, status),
+                profile_pic = COALESCE(?, profile_pic),
+                theme = COALESCE(?, theme)
+        """, (profile.username, profile.status, profile.profile_pic, profile.theme,
+              profile.status, profile.profile_pic, profile.theme))
     return {"status": "success"}
 
 @app.get("/user/{username}")
 async def get_user(username: str):
-    cursor.execute("SELECT status, profile_pic, theme FROM users WHERE username = ?", (username,))
-    row = cursor.fetchone()
+    async with db_transaction() as cursor:
+        cursor.execute("SELECT status, profile_pic, theme FROM users WHERE username = ?", (username,))
+        row = cursor.fetchone()
     if row:
         return {"status": row[0], "profile_pic": row[1], "theme": row[2]}
     return {"status": "Hey there! I am using Metaverse WhatsApp", "profile_pic": None, "theme": "dark"}
+
+class GoogleCredential(BaseModel):
+    credential: str
+
+
+def make_username(display_name: str, email: str, google_sub: str) -> str:
+    """Create a readable username while keeping Google `sub` as the real account key."""
+    base = email.split("@", 1)[0] if "@" in email else (display_name or "user")
+    base = re.sub(r"[^a-zA-Z0-9_.-]", "", base).strip("._-")[:24] or "user"
+    return base
+
+
+@app.get("/config")
+async def app_config():
+    return {"google_client_id": GOOGLE_CLIENT_ID}
+
+
+@app.post("/auth/google")
+async def google_login(data: GoogleCredential):
+    if not GOOGLE_AUTH_AVAILABLE:
+        return {"status": "error", "message": "Google authentication dependency is missing. Install google-auth."}
+
+    if not GOOGLE_CLIENT_ID or GOOGLE_CLIENT_ID.startswith("YOUR_GOOGLE_CLIENT_ID"):
+        return {"status": "error", "message": "Configure GOOGLE_CLIENT_ID before using Google Sign-In."}
+
+    try:
+        info = id_token.verify_oauth2_token(
+            data.credential,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+
+        google_sub = str(info.get("sub", ""))
+        email = str(info.get("email", ""))
+        display_name = str(info.get("name") or info.get("given_name") or email or "Google User")
+        picture = str(info.get("picture") or "")
+
+        if not google_sub:
+            return {"status": "error", "message": "Google account ID was not provided."}
+
+        async with db_transaction() as cursor:
+            cursor.execute("SELECT username FROM google_accounts WHERE google_sub = ?", (google_sub,))
+            existing = cursor.fetchone()
+
+        if existing:
+            username = existing[0]
+        else:
+            username = make_username(display_name, email, google_sub)
+
+            async with db_transaction() as cursor:
+                cursor.execute("SELECT username FROM users WHERE username = ?", (username,))
+                collision = cursor.fetchone()
+
+            if collision:
+                username = f"{username}_{google_sub[-6:]}"
+
+            async with db_transaction() as cursor:
+                cursor.execute(
+                    "INSERT INTO google_accounts (google_sub, username, email) VALUES (?, ?, ?)",
+                    (google_sub, username, email),
+                )
+
+        async with db_transaction() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO users (username, status, profile_pic, theme)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(username) DO UPDATE SET
+                    status = COALESCE(excluded.status, users.status),
+                    profile_pic = COALESCE(excluded.profile_pic, users.profile_pic)
+                """,
+                (username, f"Google account · {display_name}", picture, "dark"),
+            )
+
+        return {
+            "status": "success",
+            "username": username,
+            "display_name": display_name,
+            "email": email,
+            "profile_pic": picture,
+        }
+
+    except Exception as exc:
+        return {"status": "error", "message": f"Google Sign-In verification failed: {exc}"}
+
 
 class ContactAdd(BaseModel):
     username: str
@@ -128,14 +256,16 @@ class ContactAdd(BaseModel):
 
 @app.post("/contacts/add")
 async def add_contact(data: ContactAdd):
-    cursor.execute("INSERT OR IGNORE INTO saved_contacts (username, contact) VALUES (?, ?)", (data.username, data.contact))
-    db_conn.commit()
+    async with db_transaction() as cursor:
+        cursor.execute("INSERT OR IGNORE INTO saved_contacts (username, contact) VALUES (?, ?)",
+                       (data.username, data.contact))
     return {"status": "success"}
 
 @app.get("/contacts/{username}")
 async def get_saved_contacts(username: str):
-    cursor.execute("SELECT contact FROM saved_contacts WHERE username = ?", (username,))
-    rows = cursor.fetchall()
+    async with db_transaction() as cursor:
+        cursor.execute("SELECT contact FROM saved_contacts WHERE username = ?", (username,))
+        rows = cursor.fetchall()
     saved = [r[0] for r in rows]
     return {"contacts": saved}
 
@@ -148,15 +278,16 @@ class GroupCreate(BaseModel):
 async def create_group(group: GroupCreate):
     group_id = f"group_{uuid.uuid4().hex[:8]}"
     all_members = list(set(group.members + [group.admin]))
-    cursor.execute("INSERT INTO groups (group_id, group_name, admin, members) VALUES (?, ?, ?, ?)",
-                   (group_id, group.group_name, group.admin, json.dumps(all_members)))
-    db_conn.commit()
+    async with db_transaction() as cursor:
+        cursor.execute("INSERT INTO groups (group_id, group_name, admin, members) VALUES (?, ?, ?, ?)",
+                       (group_id, group.group_name, group.admin, json.dumps(all_members)))
     return {"group_id": group_id, "group_name": group.group_name, "members": all_members}
 
 @app.get("/groups/{username}")
 async def get_user_groups(username: str):
-    cursor.execute("SELECT group_id, group_name, admin, members FROM groups")
-    rows = cursor.fetchall()
+    async with db_transaction() as cursor:
+        cursor.execute("SELECT group_id, group_name, admin, members FROM groups")
+        rows = cursor.fetchall()
     user_groups = []
     for r in rows:
         members = json.loads(r[3])
@@ -166,19 +297,21 @@ async def get_user_groups(username: str):
 
 @app.get("/group-history/{group_id}")
 async def get_group_history(group_id: str):
-    cursor.execute("SELECT id, sender, type, content FROM group_messages WHERE group_id = ? ORDER BY id ASC", (group_id,))
-    rows = cursor.fetchall()
+    async with db_transaction() as cursor:
+        cursor.execute("SELECT id, sender, type, content FROM group_messages WHERE group_id = ? ORDER BY id ASC", (group_id,))
+        rows = cursor.fetchall()
     history = [{"id": r[0], "sender": r[1], "type": r[2], "content": r[3]} for r in rows]
     return {"history": history}
 
 @app.get("/history/{user}/{contact}")
 async def get_history(user: str, contact: str):
-    cursor.execute("""
-        SELECT id, sender, type, content FROM messages 
-        WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
-        ORDER BY id ASC
-    """, (user, contact, contact, user))
-    rows = cursor.fetchall()
+    async with db_transaction() as cursor:
+        cursor.execute("""
+            SELECT id, sender, type, content FROM messages
+            WHERE (sender = ? AND recipient = ?) OR (sender = ? AND recipient = ?)
+            ORDER BY id ASC
+        """, (user, contact, contact, user))
+        rows = cursor.fetchall()
     history = [{"id": r[0], "sender": r[1], "type": r[2], "content": r[3]} for r in rows]
     return {"history": history}
 
@@ -188,7 +321,14 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
     try:
         while True:
             data = await websocket.receive_text()
-            message_data = json.loads(data)
+            try:
+                message_data = json.loads(data)
+            except json.JSONDecodeError:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "Invalid JSON payload."
+                }))
+                continue
             
             msg_type = message_data.get("type")
             recipient_id = message_data.get("recipient_id")
@@ -202,14 +342,13 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 continue
 
             if is_group:
-                cursor.execute("INSERT INTO group_messages (group_id, sender, type, content) VALUES (?, ?, ?, ?)",
-                               (recipient_id, username, msg_type, content))
-                db_conn.commit()
-                cursor.execute("SELECT last_insert_rowid()")
-                msg_id = cursor.fetchone()[0]
+                async with db_transaction() as cursor:
+                    cursor.execute("INSERT INTO group_messages (group_id, sender, type, content) VALUES (?, ?, ?, ?)",
+                                   (recipient_id, username, msg_type, content))
+                    msg_id = cursor.lastrowid
 
-                cursor.execute("SELECT members FROM groups WHERE group_id = ?", (recipient_id,))
-                row = cursor.fetchone()
+                    cursor.execute("SELECT members FROM groups WHERE group_id = ?", (recipient_id,))
+                    row = cursor.fetchone()
                 if row:
                     members = json.loads(row[0])
                     payload = {
@@ -224,11 +363,10 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                 continue
 
             if msg_type in ["chat", "audio_note", "image"]:
-                cursor.execute("INSERT INTO messages (sender, recipient, type, content) VALUES (?, ?, ?, ?)", 
-                               (username, recipient_id, msg_type, content))
-                db_conn.commit()
-                cursor.execute("SELECT last_insert_rowid()")
-                msg_id = cursor.fetchone()[0]
+                async with db_transaction() as cursor:
+                    cursor.execute("INSERT INTO messages (sender, recipient, type, content) VALUES (?, ?, ?, ?)",
+                                   (username, recipient_id, msg_type, content))
+                    msg_id = cursor.lastrowid
 
                 payload = {
                     "id": msg_id,
@@ -241,6 +379,11 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
     except WebSocketDisconnect:
         manager.disconnect(username)
         await manager.broadcast_user_list()
+
+
+@app.get("/")
+async def home():
+    return HTMLResponse(HTML_CONTENT.replace("__GOOGLE_CLIENT_ID__", GOOGLE_CLIENT_ID))
 
 
 # ==================== FRONTEND UI ====================
@@ -363,6 +506,10 @@ HTML_CONTENT = """
         .sel-btn { background: var(--bg-secondary); border: 1px solid var(--border); color: var(--text-main); padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13px; transition: 0.2s; }
         .sel-btn:hover { border-color: var(--accent); color: var(--accent); }
 
+        .profile-trigger { cursor: pointer; transition: transform .18s ease, box-shadow .18s ease; }
+        .profile-trigger:hover { transform: scale(1.04); box-shadow: 0 0 0 3px rgba(0,242,254,.10); }
+        .google-note { font-size: 11px; line-height: 1.5; color: var(--text-muted); margin-top: 12px; }
+
         /* Call Screen Modal */
         #call-modal { position: absolute; inset: 0; background: rgba(0,0,0,0.92); z-index: 400; display: flex; flex-direction: column; justify-content: center; align-items: center; }
         .call-container { width: 90%; max-width: 800px; height: 75vh; background: var(--bg-panel); border-radius: 16px; border: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; position: relative; }
@@ -382,6 +529,212 @@ HTML_CONTENT = """
             #app-container.mobile-chat-open .chat-panel { display: flex; }
             #backToContactsBtn { display: inline-block !important; }
         }
+
+        /* ===== ADVANCED UI LAYER ===== */
+        :root {
+            --glass: rgba(255,255,255,.055);
+            --glass-strong: rgba(255,255,255,.09);
+            --shadow-lg: 0 24px 70px rgba(0,0,0,.38);
+            --radius-lg: 22px;
+            --radius-md: 14px;
+            --ease: cubic-bezier(.2,.8,.2,1);
+        }
+
+        html { color-scheme: dark; }
+        body {
+            background:
+                radial-gradient(circle at 12% 12%, rgba(0,242,254,.12), transparent 30%),
+                radial-gradient(circle at 88% 82%, rgba(59,130,246,.13), transparent 34%),
+                var(--bg-primary);
+        }
+
+        #app-container {
+            width: min(1500px, 96vw);
+            height: min(920px, 94vh);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-lg);
+            backdrop-filter: blur(18px);
+            animation: appIn .45s var(--ease);
+        }
+
+        @keyframes appIn {
+            from { opacity: 0; transform: translateY(14px) scale(.985); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        .sidebar,
+        .chat-panel,
+        .chat-header,
+        .sidebar-header,
+        .chat-input-area,
+        .modal-content {
+            backdrop-filter: blur(18px);
+        }
+
+        .sidebar-header {
+            box-shadow: 0 1px 0 rgba(255,255,255,.025);
+        }
+
+        .header-btn, .sel-btn, .action-btn {
+            transition: transform .18s var(--ease), border-color .18s, background .18s, color .18s, box-shadow .18s;
+        }
+
+        .header-btn:hover, .sel-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 8px 22px rgba(0,0,0,.18);
+        }
+
+        .contact-item {
+            margin: 5px 8px;
+            padding: 12px 13px;
+            border: 1px solid transparent;
+            border-radius: 13px;
+        }
+
+        .contact-item:hover, .contact-item.active {
+            border-left: 1px solid var(--accent);
+            background: linear-gradient(90deg, var(--glass-strong), transparent);
+            box-shadow: inset 0 0 20px rgba(0,242,254,.025);
+        }
+
+        .contact-avatar {
+            box-shadow: 0 7px 20px rgba(0,0,0,.18);
+        }
+
+        .chat-messages {
+            background:
+                radial-gradient(circle at 20% 10%, rgba(0,242,254,.025), transparent 24%),
+                radial-gradient(circle at 80% 90%, rgba(59,130,246,.035), transparent 28%);
+            scrollbar-width: thin;
+        }
+
+        .message {
+            border-radius: 16px;
+            animation: messageIn .22s var(--ease);
+        }
+
+        @keyframes messageIn {
+            from { opacity: 0; transform: translateY(5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message.outgoing {
+            background: linear-gradient(135deg, #059669, #047857);
+            box-shadow: 0 8px 24px rgba(5,150,105,.16);
+        }
+
+        .message.incoming {
+            background: linear-gradient(135deg, rgba(31,41,55,.94), rgba(17,24,39,.94));
+        }
+
+        .chat-input-area {
+            padding: 14px 18px;
+            gap: 12px;
+        }
+
+        .chat-input-area input {
+            height: 48px;
+            border-radius: 15px;
+            background: var(--glass);
+        }
+
+        .action-btn {
+            width: 42px;
+            height: 42px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 12px;
+        }
+
+        .action-btn:hover {
+            background: var(--glass-strong);
+            transform: translateY(-1px);
+        }
+
+        .modal-overlay {
+            background: rgba(0,0,0,.72);
+            backdrop-filter: blur(10px);
+        }
+
+        .modal-content {
+            border-radius: 20px;
+            box-shadow: 0 30px 90px rgba(0,0,0,.45);
+            animation: modalIn .25s var(--ease);
+        }
+
+        @keyframes modalIn {
+            from { opacity: 0; transform: scale(.96) translateY(8px); }
+            to { opacity: 1; transform: scale(1) translateY(0); }
+        }
+
+        #call-modal {
+            background: radial-gradient(circle at center, rgba(0,242,254,.08), rgba(0,0,0,.94) 55%);
+            backdrop-filter: blur(12px);
+        }
+
+        .call-container {
+            width: min(1100px, 94vw);
+            height: min(760px, 82vh);
+            border-radius: 22px;
+            box-shadow: 0 35px 100px rgba(0,0,0,.6);
+        }
+
+        .call-videos {
+            background: #030508;
+        }
+
+        #remoteVideo {
+            background: radial-gradient(circle, #111827, #030508);
+        }
+
+        #localVideo {
+            width: 180px;
+            height: 125px;
+            position: absolute;
+            bottom: 18px;
+            right: 18px;
+            border-radius: 14px;
+            border: 2px solid var(--accent);
+            object-fit: cover;
+            background: #111;
+            box-shadow: 0 12px 30px rgba(0,0,0,.45);
+        }
+
+        .call-controls {
+            height: 82px;
+        }
+
+        .call-btn {
+            min-width: 110px;
+            box-shadow: 0 8px 24px rgba(0,0,0,.2);
+            transition: transform .18s var(--ease);
+        }
+
+        .call-btn:hover { transform: translateY(-2px); }
+
+        input:focus, textarea:focus {
+            box-shadow: 0 0 0 3px rgba(0,242,254,.08);
+        }
+
+        ::selection { background: rgba(0,242,254,.25); }
+
+        @media (max-width: 768px) {
+            #app-container { width: 100%; height: 100dvh; }
+            .contact-item { margin: 4px 6px; }
+            .chat-messages { padding: 14px; }
+            .message { max-width: 88%; }
+            #localVideo { width: 125px; height: 90px; right: 10px; bottom: 10px; }
+            .call-container { width: 100%; height: 100%; border-radius: 0; }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: .01ms !important;
+                transition-duration: .01ms !important;
+            }
+        }
+
     </style>
 </head>
 <body class="theme-dark">
@@ -401,6 +754,7 @@ HTML_CONTENT = """
                     </div>
                     <div class="g_id_signin" data-type="standard" data-shape="pill" data-theme="filled_black" data-size="large"></div>
                 </div>
+                <div class="google-note">Google securely verifies your ID token on the server before creating your account.</div>
 
                 <div class="divider">or quick manual access</div>
                 
@@ -524,7 +878,7 @@ HTML_CONTENT = """
                 </div>
                 <div class="call-videos">
                     <video id="remoteVideo" autoplay playsinline></video>
-                    <video id="video-local" id="localVideo" autoplay playsinline muted style="width: 120px; height: 90px; position: absolute; bottom: 15px; right: 15px; border-radius: 8px; border: 2px solid var(--accent); object-fit: cover; background: #222;"></video>
+                    <video id="localVideo" autoplay playsinline muted></video>
                 </div>
                 <div class="call-controls">
                     <button class="call-btn end" onclick="endCall()">End Call</button>
@@ -594,15 +948,32 @@ HTML_CONTENT = """
             }
         }
 
-        function handleGoogleLogin(response) {
+        async function handleGoogleLogin(response) {
+            if (!response || !response.credential) {
+                alert("Google did not return a credential.");
+                return;
+            }
             try {
-                const base64Url = response.credential.split('.')[1];
-                const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-                const jsonPayload = decodeURIComponent(atob(base64).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
-                const payload = JSON.parse(jsonPayload);
-                if (payload.email) initializeUserSession(payload.email);
+                const res = await fetch("/auth/google", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ credential: response.credential })
+                });
+                const data = await res.json();
+                if (data.status !== "success") {
+                    alert(data.message || "Google Sign-In failed.");
+                    return;
+                }
+                currentUser = data.username;
+                userStatus = data.display_name ? `Google account · ${data.display_name}` : userStatus;
+                userProfilePic = data.profile_pic || "";
+                localStorage.setItem("metaverse_user", currentUser);
+                localStorage.setItem("metaverse_google_signed_in", "1");
+                await fetchUserData(currentUser);
+                initializeUserSession(currentUser);
             } catch (err) {
-                alert("Google Sign-In verification error.");
+                console.error(err);
+                alert("Unable to complete Google Sign-In.");
             }
         }
 
@@ -708,9 +1079,28 @@ HTML_CONTENT = """
             } catch (err) { console.error("Failed to load groups", err); }
         }
 
+        let reconnectTimer = null;
+
         function connectWebSocket() {
+            if (!currentUser) return;
             const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
             ws = new WebSocket(`${wsProtocol}${window.location.host}/ws/${encodeURIComponent(currentUser)}`);
+
+            ws.onopen = () => {
+                console.log("WebSocket connected");
+                if (reconnectTimer) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
+            };
+
+            ws.onclose = () => {
+                if (currentUser) {
+                    reconnectTimer = setTimeout(connectWebSocket, 1800);
+                }
+            };
+
+            ws.onerror = () => ws.close();
             
             ws.onmessage = async function(event) {
                 const data = JSON.parse(event.data);
@@ -761,6 +1151,23 @@ HTML_CONTENT = """
             };
         }
 
+        function escapeHtml(value) {
+            return String(value ?? "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+        }
+
+        function escapeJs(value) {
+            return String(value ?? "")
+                .replace(/\\/g, "\\\\")
+                .replace(/'/g, "\\'")
+                .replace(/\n/g, "\\n")
+                .replace(/\r/g, "\\r");
+        }
+
         function renderContacts(filter = "") {
             const container = document.getElementById("contactsListContainer");
             container.innerHTML = "";
@@ -769,10 +1176,10 @@ HTML_CONTENT = """
                 if (!grp.group_name.toLowerCase().includes(filter.toLowerCase())) return;
                 const isActive = activeContact === grp.group_id ? "active" : "";
                 container.innerHTML += `
-                    <div class="contact-item ${isActive}" onclick="selectGroup('${grp.group_id}', '${grp.group_name}')">
+                    <div class="contact-item ${isActive}" onclick="selectGroup('${escapeJs(grp.group_id)}', '${escapeJs(grp.group_name)}')">
                         <div class="contact-avatar" style="background: var(--accent-gradient);">👥</div>
                         <div class="contact-details">
-                            <h4>${grp.group_name}</h4>
+                            <h4>${escapeHtml(grp.group_name)}</h4>
                             <p>Group (${grp.members.length} members)</p>
                         </div>
                     </div>
@@ -785,14 +1192,16 @@ HTML_CONTENT = """
                 const isOnline = onlineUsers.includes(email);
                 const isActive = activeContact === email ? "active" : "";
 
+                const safeEmail = escapeHtml(email);
+                const jsEmail = escapeJs(email);
                 container.innerHTML += `
-                    <div class="contact-item ${isActive}" onclick="selectContact('${email}')">
-                        <div class="contact-avatar">
-                            ${email.charAt(0).toUpperCase()}<div class="${isOnline ? 'online-dot' : 'offline-dot'}"></div>
+                    <div class="contact-item ${isActive}" onclick="selectContact('${jsEmail}')">
+                        <div class="contact-avatar profile-trigger" onclick="openUserProfile('${jsEmail}', event)" title="View profile">
+                            ${escapeHtml(email.charAt(0).toUpperCase())}<div class="${isOnline ? 'online-dot' : 'offline-dot'}"></div>
                         </div>
-                        <div class="contact-details">
-                            <h4>${email}</h4>
-                            <p>${isOnline ? 'Online' : 'Offline'}</p>
+                        <div class="contact-details" onclick="openUserProfile('${jsEmail}', event)" title="View profile">
+                            <h4>${safeEmail}</h4>
+                            <p>${isOnline ? 'Online · View profile' : 'Offline · View profile'}</p>
                         </div>
                     </div>
                 `;
@@ -851,19 +1260,34 @@ HTML_CONTENT = """
             activeContact = null;
         }
 
-        function openContactProfile() {
-            if (!activeContact || isGroupActive) return;
-            document.getElementById("modalProfileName").innerText = activeContact;
-            document.getElementById("modalProfileStatus").innerText = onlineUsers.includes(activeContact) ? "Online" : "Offline";
-            document.getElementById("modalProfileAvatar").innerHTML = activeContact.charAt(0).toUpperCase();
-            
-            const btnWrapper = document.getElementById("addToContactsBtnWrapper");
-            if (savedContacts.includes(activeContact)) {
-                btnWrapper.innerHTML = `<p style="color: #10b981; font-weight: 600; margin-bottom: 10px;">✓ Already in Contacts</p>`;
-            } else {
-                btnWrapper.innerHTML = `<button class="sel-btn" style="width: 100%; background: var(--accent-gradient); color: white; margin-bottom: 10px;" onclick="addCurrentContactPermanent()">➕ Add to Contacts</button>`;
+        async function openUserProfile(username, event) {
+            if (event) event.stopPropagation();
+            if (!username || username === currentUser) return;
+            activeContact = username;
+            isGroupActive = false;
+            try {
+                const res = await fetch(`/user/${encodeURIComponent(username)}`);
+                const data = await res.json();
+                document.getElementById("modalProfileName").innerText = username;
+                document.getElementById("modalProfileStatus").innerText = data.status || (onlineUsers.includes(username) ? "Online" : "Offline");
+                const avatar = document.getElementById("modalProfileAvatar");
+                avatar.innerHTML = data.profile_pic ? `<img src="${escapeHtml(data.profile_pic)}" alt="Profile">` : escapeHtml(username.charAt(0).toUpperCase());
+                const btnWrapper = document.getElementById("addToContactsBtnWrapper");
+                if (savedContacts.includes(username)) {
+                    btnWrapper.innerHTML = `<p style="color:#10b981;font-weight:600;margin-bottom:10px;">✓ Already in Contacts</p>`;
+                } else {
+                    btnWrapper.innerHTML = `<button class="sel-btn" style="width:100%;background:var(--accent-gradient);color:white;margin-bottom:10px;" onclick="addCurrentContactPermanent()">➕ Add to Contacts</button>`;
+                }
+                document.getElementById("contact-profile-modal").classList.remove("hidden");
+            } catch (err) {
+                console.error(err);
+                alert("Could not load this profile.");
             }
-            document.getElementById("contact-profile-modal").classList.remove("hidden");
+        }
+
+        async function openContactProfile() {
+            if (!activeContact || isGroupActive) return;
+            await openUserProfile(activeContact);
         }
 
         function closeContactProfile() { document.getElementById("contact-profile-modal").classList.add("hidden"); }
@@ -1006,7 +1430,7 @@ HTML_CONTENT = """
                     audio: true,
                     video: currentCallType === 'video'
                 });
-                document.getElementById("video-local").srcObject = localStream;
+                document.getElementById("localVideo").srcObject = localStream;
 
                 peerConnection = new RTCPeerConnection(rtcConfig);
                 localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
@@ -1063,6 +1487,15 @@ HTML_CONTENT = """
             currentCallType = null;
         }
 
+        function escapeHTML(value) {
+            return String(value ?? "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
         function renderMessages() {
             const container = document.getElementById("chatMessagesContainer");
             container.innerHTML = "";
@@ -1072,11 +1505,11 @@ HTML_CONTENT = """
                 const isOutgoing = msg.sender === "You" || msg.sender === currentUser;
                 let contentHTML = "";
                 if (msg.type === "image") {
-                    contentHTML = `<img src="${msg.content}" style="max-width: 220px; border-radius: 8px;">`;
+                    contentHTML = `<img src="${escapeHTML(msg.content)}" alt="Shared image" loading="lazy" style="max-width: 220px; border-radius: 8px;">`;
                 } else if (msg.type === "audio_note") {
-                    contentHTML = `<audio controls src="${msg.content}" style="max-width: 220px; height: 36px;"></audio>`;
+                    contentHTML = `<audio controls preload="metadata" src="${escapeHTML(msg.content)}" style="max-width: 220px; height: 36px;"></audio>`;
                 } else {
-                    contentHTML = `<span>${msg.content}</span>`;
+                    contentHTML = `<span>${escapeHTML(msg.content)}</span>`;
                 }
                 const senderLabel = isGroupActive && !isOutgoing ? `<div style="font-size: 11px; color: var(--accent); margin-bottom: 2px; font-weight: bold;">${msg.sender}</div>` : "";
 
@@ -1120,6 +1553,7 @@ HTML_CONTENT = """
             if (!file || !activeContact) return;
             const reader = new FileReader();
             reader.onload = function() {
+                if (!ws || ws.readyState !== WebSocket.OPEN) { alert("Connection is offline. Please wait a moment."); return; }
                 ws.send(JSON.stringify({ type: "image", recipient_id: activeContact, message: reader.result, is_group: isGroupActive }));
                 if (!isGroupActive) {
                     if (!chatHistories[activeContact]) chatHistories[activeContact] = [];
