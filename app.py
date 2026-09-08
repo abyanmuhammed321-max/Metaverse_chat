@@ -309,6 +309,7 @@ HTML_CONTENT = """
 
         #login-box input { width: 100%; padding: 12px 16px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; color: var(--text-main); font-size: 14px; outline: none; margin-bottom: 14px; text-align: center; }
         #login-box input:focus { border-color: var(--accent); }
+        #login-box button.manual-login { width: 100%; padding: 12px; background: var(--accent-gradient); color: #fff; border: none; border-radius: 10px; font-weight: bold; font-size: 14px; cursor: pointer; transition: 0.2s; }
 
         .sidebar { width: 35%; background: var(--bg-panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; height: 100%; }
         .sidebar-header { padding: 16px 20px; background: var(--bg-secondary); display: flex; align-items: center; justify-content: space-between; height: 75px; border-bottom: 1px solid var(--border); }
@@ -394,14 +395,17 @@ HTML_CONTENT = """
                 
                 <div class="google-btn-wrapper">
                     <div id="g_id_onload"
-                         data-client_id="358332042325-3s7o118sjfv1qug4r6qlmf534083ti10.apps.googleusercontent.com"
-                         data-callback="handleGoogleLogin"
-                         data-auto_prompt="true">
+                         data-client_id="YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
+                         
+                         data-auto_select="true">
                     </div>
                     <div class="g_id_signin" data-type="standard" data-shape="pill" data-theme="filled_black" data-size="large"></div>
                 </div>
 
+                <div class="divider">or quick manual access</div>
                 
+                <input type="text" id="loginUsernameInput" placeholder="Enter custom username..." onkeypress="handleLoginKey(event)">
+                <button class="manual-login" onclick="performManualLogin()">Initialize Session</button>
             </div>
         </div>
 
@@ -602,12 +606,6 @@ HTML_CONTENT = """
             }
         }
 
-
-            if (!val) { alert("Please enter a username."); return; }
-            await fetchUserData(val);
-            initializeUserSession(val);
-        }
-
         async function initializeUserSession(username) {
             currentUser = username;
             localStorage.setItem("metaverse_user", currentUser);
@@ -640,7 +638,7 @@ HTML_CONTENT = """
             await fetch("/user/update", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ username: currentUser, status: userStatus, profile_pic: userProfilePic || (googleProfile && googleProfile.picture) || "", theme: currentTheme, display_name: (googleProfile && googleProfile.name) || currentUser, google_sub: (googleProfile && googleProfile.sub) || null })
+                body: JSON.stringify({ username: currentUser, status: userStatus, profile_pic: userProfilePic, theme: currentTheme })
             });
         }
 
