@@ -378,7 +378,7 @@ HTML_CONTENT = """
                     <div id="g_id_onload"
                          data-client_id="358332042325-3s7o118sjfv1qug4r6qlmf534083ti10.apps.googleusercontent.com"
                          data-callback="handleGoogleLogin"
-                         data-auto_select="false"
+                         data-auto_select="true"
                          data-cookie_policy="single_host_origin">
                     </div>
                     <div class="g_id_signin" 
