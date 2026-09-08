@@ -354,8 +354,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     }
                     await manager.broadcast_to_group(recipient_id, payload, json.loads(row[0]))
                 continue
-
-            if msg_type in ["chat", "audio_note", "image"]:
+if msg_type in ["chat", "audio_note", "image"]:
                 cursor.execute("INSERT INTO messages (sender, recipient, type, content, view_once) VALUES (?, ?, ?, ?, ?)", 
                                (username, recipient_id, msg_type, content, view_once))
                 db_conn.commit()
@@ -367,6 +366,8 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     "view_once": view_once, "is_edited": 0, "is_pinned": 0, "reactions": {}
                 }
                 await manager.send_personal_message(payload, recipient_id)
+                await manager.send_personal_message(payload, username)  # <-- Add this line to echo it back to yourself
+                continue
                 
     except WebSocketDisconnect:
         manager.disconnect(username)
