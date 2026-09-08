@@ -20,6 +20,20 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            username TEXT PRIMARY KEY,
+            avatar TEXT,
+            status TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_contacts (
+            owner TEXT,
+            contact TEXT,
+            PRIMARY KEY (owner, contact)
+        )
+    """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat ON messages (sender, recipient)")
     conn.commit()
     return conn
@@ -66,14 +80,47 @@ async def get_history(user: str, contact: str):
 
 @app.get("/contacts/{username}")
 async def get_saved_contacts(username: str):
+    # Get explicitly saved contacts + contacts with message history
+    cursor.execute("SELECT contact FROM user_contacts WHERE owner = ?", (username,))
+    saved = [r[0] for r in cursor.fetchall()]
+
     cursor.execute("""
         SELECT DISTINCT sender FROM messages WHERE recipient = ?
         UNION
         SELECT DISTINCT recipient FROM messages WHERE sender = ?
     """, (username, username))
-    rows = cursor.fetchall()
-    contacts = [r[0] for r in rows if r[0] and r[0] != "Brian 🧠 (AI Archive)"]
-    return {"contacts": contacts}
+    msg_contacts = [r[0] for r in cursor.fetchall() if r[0] and r[0] != "Brian 🧠 (AI Archive)"]
+    
+    all_contacts = list(set(saved + msg_contacts))
+    return {"contacts": all_contacts, "explicit_saved": saved}
+
+@app.post("/saved-contacts")
+async def add_saved_contact(data: dict):
+    owner = data.get("owner")
+    contact = data.get("contact")
+    cursor.execute("INSERT OR IGNORE INTO user_contacts (owner, contact) VALUES (?, ?)", (owner, contact))
+    db_conn.commit()
+    return {"status": "success"}
+
+@app.get("/profile/{username}")
+async def get_profile(username: str):
+    cursor.execute("SELECT avatar, status FROM profiles WHERE username = ?", (username,))
+    row = cursor.fetchone()
+    if row:
+        return {"avatar": row[0] or "", "status": row[1] or "Hey there! I am using Metaverse WhatsApp"}
+    return {"avatar": "", "status": "Hey there! I am using Metaverse WhatsApp"}
+
+@app.post("/profile")
+async def update_profile(data: dict):
+    username = data.get("username")
+    avatar = data.get("avatar")
+    status = data.get("status")
+    cursor.execute("""
+        INSERT INTO profiles (username, avatar, status) VALUES (?, ?, ?)
+        ON CONFLICT(username) DO UPDATE SET avatar = excluded.avatar, status = excluded.status
+    """, (username, avatar, status))
+    db_conn.commit()
+    return {"status": "success"}
 
 @app.delete("/message/{msg_id}")
 async def delete_message(msg_id: int):
@@ -255,7 +302,10 @@ HTML_CONTENT = """
         /* Sidebar */
         .sidebar { width: 35%; background: var(--bg-panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; height: 100%; }
         .sidebar-header { padding: 16px 20px; background: var(--bg-secondary); display: flex; align-items: center; justify-content: space-between; height: 75px; border-bottom: 1px solid var(--border); }
-        .my-profile { font-weight: 600; color: var(--accent); font-size: 14px; display: flex; align-items: center; gap: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
+        .my-profile-container { display: flex; align-items: center; gap: 10px; overflow: hidden; cursor: pointer; }
+        .profile-avatar-sm { width: 42px; height: 42px; border-radius: 50%; background: var(--accent-gradient); color: var(--bg-primary); display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 16px; overflow: hidden; flex-shrink: 0; border: 2px solid var(--accent); }
+        .profile-avatar-sm img { width: 100%; height: 100%; object-fit: cover; }
+        .my-profile { font-weight: 600; color: var(--accent); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }
         
         .sidebar-toolbar { padding: 12px 18px; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
         .sidebar-toolbar input { flex: 1; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: white; font-size: 13px; outline: none; }
@@ -264,11 +314,13 @@ HTML_CONTENT = """
         .contacts-list { flex: 1; overflow-y: auto; }
         .contact-item { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid rgba(255,255,255,0.03); cursor: pointer; transition: 0.2s; position: relative; }
         .contact-item:hover, .contact-item.active { background: #374151; border-left: 4px solid var(--accent); }
-        .contact-avatar { width: 48px; height: 48px; border-radius: 50%; background: var(--accent-gradient); color: var(--bg-primary); display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 18px; margin-right: 14px; position: relative; flex-shrink: 0; }
-        .online-dot { width: 12px; height: 12px; background: #10b981; border: 2px solid var(--bg-panel); border-radius: 50%; position: absolute; bottom: 0; right: 0; }
-        .offline-dot { width: 12px; height: 12px; background: #6b7280; border: 2px solid var(--bg-panel); border-radius: 50%; position: absolute; bottom: 0; right: 0; }
-        .contact-details h4 { font-size: 15px; color: var(--text-main); font-weight: 500; }
+        .contact-avatar { width: 48px; height: 48px; border-radius: 50%; background: var(--accent-gradient); color: var(--bg-primary); display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 18px; margin-right: 14px; position: relative; flex-shrink: 0; overflow: hidden; }
+        .contact-avatar img { width: 100%; height: 100%; object-fit: cover; }
+        .online-dot { width: 12px; height: 12px; background: #10b981; border: 2px solid var(--bg-panel); border-radius: 50%; position: absolute; bottom: 0; right: 0; z-index: 2; }
+        .offline-dot { width: 12px; height: 12px; background: #6b7280; border: 2px solid var(--bg-panel); border-radius: 50%; position: absolute; bottom: 0; right: 0; z-index: 2; }
+        .contact-details h4 { font-size: 15px; color: var(--text-main); font-weight: 500; display: flex; align-items: center; gap: 6px; }
         .contact-details p { font-size: 12px; color: var(--accent); margin-top: 3px; }
+        .saved-badge { font-size: 10px; background: rgba(0, 242, 254, 0.2); color: var(--accent); padding: 1px 6px; border-radius: 4px; border: 1px solid var(--accent); }
 
         /* Context Menu */
         #context-menu { position: absolute; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.6); z-index: 1000; display: none; padding: 6px 0; }
@@ -323,7 +375,7 @@ HTML_CONTENT = """
         .action-btn.recording { color: #ef4444; animation: pulse 1s infinite; }
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
 
-        /* Modals (Settings & Forward) */
+        /* Modals */
         .modal-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.8); z-index: 300; display: flex; justify-content: center; align-items: center; backdrop-filter: blur(5px); padding: 20px; }
         .modal-content { background: var(--bg-panel); border: 1px solid var(--border); padding: 25px; border-radius: 16px; width: 100%; max-width: 400px; box-shadow: 0 15px 35px rgba(0,0,0,0.6); }
         .modal-content h3 { color: var(--accent); margin-bottom: 16px; font-size: 18px; }
@@ -400,7 +452,10 @@ HTML_CONTENT = """
         <!-- Sidebar -->
         <div class="sidebar">
             <div class="sidebar-header">
-                <div class="my-profile" id="my-profile-display" title="Node">⚡ Node</div>
+                <div class="my-profile-container" onclick="openSettingsModal()" title="Open Profile Settings">
+                    <div class="profile-avatar-sm" id="myProfileAvatarSm">⚡</div>
+                    <div class="my-profile" id="my-profile-display">Node</div>
+                </div>
                 <div style="display: flex; gap: 6px;">
                     <button class="header-btn" onclick="openSettingsModal()" title="Settings">⚙️</button>
                     <button class="header-btn" onclick="logout()" title="Logout" style="font-size: 11px; padding: 5px 8px;">Logout</button>
@@ -429,6 +484,7 @@ HTML_CONTENT = """
                     </div>
                 </div>
                 <div class="header-actions">
+                    <button class="header-btn hidden" id="addContactHeaderBtn" onclick="addCurrentContactToSaved()">➕ Add to Contacts</button>
                     <button class="header-btn hidden" id="selectModeBtn" onclick="toggleSelectMode()">Select</button>
                     <button class="call-btn hidden" id="audioCallBtn" onclick="startCall(false)">📞 Voice Call</button>
                     <button class="call-btn hidden" id="videoCallBtn" onclick="startCall(true)">🔮 Video Call</button>
@@ -476,6 +532,13 @@ HTML_CONTENT = """
         <div id="settings-modal" class="modal-overlay hidden">
             <div class="modal-content">
                 <h3>⚙️ WhatsApp & Profile Settings</h3>
+                
+                <label>Profile Picture</label>
+                <div style="display: flex; align-items: center; gap: 12px; margin-top: 6px;">
+                    <div class="profile-avatar-sm" id="settingsAvatarPreviewBox" style="width: 50px; height: 50px; font-size: 20px;">⚡</div>
+                    <input type="file" id="settingsAvatarFile" accept="image/*" style="font-size: 12px; padding: 6px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: white;" onchange="previewAvatar(event)">
+                </div>
+
                 <label>Display Name</label>
                 <input type="text" id="settingsNameInput" placeholder="Your name...">
                 
@@ -529,9 +592,11 @@ HTML_CONTENT = """
     <script>
         let ws;
         let currentUser = localStorage.getItem("metaverse_user") || null;
-        let userStatus = localStorage.getItem("metaverse_status") || "Hey there! I am using Metaverse WhatsApp";
+        let userStatus = "Hey there! I am using Metaverse WhatsApp";
+        let userAvatar = "";
         let onlineUsers = [];
-        let savedContacts = [];
+        let allContacts = [];
+        let explicitSavedContacts = [];
         let activeContact = null;
         let chatHistories = {};
         
@@ -589,15 +654,36 @@ HTML_CONTENT = """
             initializeUserSession(inputVal);
         }
 
-        function initializeUserSession(username) {
+        async function initializeUserSession(username) {
             currentUser = username;
             localStorage.setItem("metaverse_user", currentUser);
 
-            document.getElementById("my-profile-display").innerText = `⚡ ${currentUser}`;
-            document.getElementById("my-profile-display").title = userStatus;
+            await loadUserProfile();
             document.getElementById("login-screen").classList.add("hidden");
             connectWebSocket();
-            fetchSavedContacts();
+            await fetchSavedContacts();
+        }
+
+        async function loadUserProfile() {
+            try {
+                const res = await fetch(`/profile/${encodeURIComponent(currentUser)}`);
+                const data = await res.json();
+                userStatus = data.status;
+                userAvatar = data.avatar;
+                updateProfileDisplay();
+            } catch (err) {
+                console.error("Failed to load profile", err);
+            }
+        }
+
+        function updateProfileDisplay() {
+            document.getElementById("my-profile-display").innerText = currentUser;
+            const smBox = document.getElementById("myProfileAvatarSm");
+            if (userAvatar) {
+                smBox.innerHTML = `<img src="${userAvatar}" alt="Avatar">`;
+            } else {
+                smBox.innerText = currentUser.charAt(0).toUpperCase();
+            }
         }
 
         function logout() {
@@ -613,6 +699,14 @@ HTML_CONTENT = """
         function openSettingsModal() {
             document.getElementById("settingsNameInput").value = currentUser;
             document.getElementById("settingsStatusInput").value = userStatus;
+            
+            const previewBox = document.getElementById("settingsAvatarPreviewBox");
+            if (userAvatar) {
+                previewBox.innerHTML = `<img src="${userAvatar}" style="width:100%; height:100%; object-fit:cover; border-radius:50%;">`;
+            } else {
+                previewBox.innerText = currentUser.charAt(0).toUpperCase();
+            }
+
             document.getElementById("settings-modal").classList.remove("hidden");
         }
 
@@ -620,21 +714,43 @@ HTML_CONTENT = """
             document.getElementById("settings-modal").classList.add("hidden");
         }
 
-        function saveSettings() {
+        function previewAvatar(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function() {
+                userAvatar = reader.result;
+                const previewBox = document.getElementById("settingsAvatarPreviewBox");
+                previewBox.innerHTML = `<img src="${userAvatar}" style="width:100%; height:100%; object-fit:cover; border-radius:50%;">`;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        async function saveSettings() {
             const newName = document.getElementById("settingsNameInput").value.trim();
             const newStatus = document.getElementById("settingsStatusInput").value.trim();
-            if (newName) {
+            
+            if (newName && newName !== currentUser) {
                 currentUser = newName;
                 localStorage.setItem("metaverse_user", currentUser);
             }
             if (newStatus) {
                 userStatus = newStatus;
-                localStorage.setItem("metaverse_status", userStatus);
             }
-            document.getElementById("my-profile-display").innerText = `⚡ ${currentUser}`;
-            document.getElementById("my-profile-display").title = userStatus;
+
+            try {
+                await fetch('/profile', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: currentUser, avatar: userAvatar, status: userStatus })
+                });
+            } catch (err) {
+                console.error("Failed to save profile on server", err);
+            }
+
+            updateProfileDisplay();
             closeSettingsModal();
-            alert("Settings updated successfully!");
+            alert("Settings and profile updated successfully!");
         }
 
         function toggleGhostMode() {
@@ -663,10 +779,33 @@ HTML_CONTENT = """
             try {
                 const res = await fetch(`/contacts/${encodeURIComponent(currentUser)}`);
                 const data = await res.json();
-                savedContacts = data.contacts;
+                allContacts = data.contacts;
+                explicitSavedContacts = data.explicit_saved;
                 renderContacts();
             } catch (err) {
                 console.error("Failed to load saved contacts", err);
+            }
+        }
+
+        async function addCurrentContactToSaved() {
+            if (!activeContact || activeContact === "Brian 🧠 (AI Archive)") return;
+            try {
+                await fetch('/saved-contacts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ owner: currentUser, contact: activeContact })
+                });
+                if (!explicitSavedContacts.includes(activeContact)) {
+                    explicitSavedContacts.push(activeContact);
+                }
+                if (!allContacts.includes(activeContact)) {
+                    allContacts.push(activeContact);
+                }
+                document.getElementById("addContactHeaderBtn").classList.add("hidden");
+                renderContacts();
+                alert(`${activeContact} permanently added to your contacts!`);
+            } catch (err) {
+                console.error("Failed to add contact", err);
             }
         }
 
@@ -702,8 +841,8 @@ HTML_CONTENT = """
                     const msgObj = { id: data.id, sender: sender, type: data.type, content: data.message };
                     chatHistories[sender].push(msgObj);
                     
-                    if (!savedContacts.includes(sender) && sender !== "Brian 🧠 (AI Archive)") {
-                        savedContacts.push(sender);
+                    if (!allContacts.includes(sender) && sender !== "Brian 🧠 (AI Archive)") {
+                        allContacts.push(sender);
                     }
 
                     if (activeContact === sender) renderMessages();
@@ -725,13 +864,14 @@ HTML_CONTENT = """
             const container = document.getElementById("contactsListContainer");
             container.innerHTML = "";
             
-            const allContactSet = new Set([...onlineUsers, ...savedContacts, "Brian 🧠 (AI Archive)"]);
+            const fullContactSet = new Set([...onlineUsers, ...allContacts, "Brian 🧠 (AI Archive)"]);
             
-            allContactSet.forEach(email => {
+            fullContactSet.forEach(email => {
                 if (email === currentUser || !email.toLowerCase().includes(filter.toLowerCase())) return;
                 
                 const isOnline = onlineUsers.includes(email) || email === "Brian 🧠 (AI Archive)";
                 const isActive = activeContact === email ? "active" : "";
+                const isSavedExplicitly = explicitSavedContacts.includes(email) || email === "Brian 🧠 (AI Archive)";
                 
                 const contactDiv = document.createElement("div");
                 contactDiv.className = `contact-item ${isActive}`;
@@ -749,14 +889,18 @@ HTML_CONTENT = """
                 const initial = email === "Brian 🧠 (AI Archive)" ? "🧠" : email.charAt(0).toUpperCase();
                 const dotClass = isOnline ? "online-dot" : "offline-dot";
                 const statusText = email === "Brian 🧠 (AI Archive)" ? "AI Memory Vault" : (isOnline ? "Online" : "Offline");
+                const savedBadgeHTML = isSavedExplicitly ? `<span class="saved-badge">Saved</span>` : "";
 
                 contactDiv.innerHTML = `
                     <div class="contact-avatar">
                         ${initial}<div class="${dotClass}"></div>
                     </div>
-                    <div class="contact-details">
-                        <h4>${email}</h4>
-                        <p>${statusText}</p>
+                    <div class="contacts-details" style="flex:1; overflow:hidden;">
+                        <h4 style="font-size: 15px; color: var(--text-main); font-weight: 500; display:flex; align-items:center; justify-content:space-between;">
+                            <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${email}</span>
+                            ${savedBadgeHTML}
+                        </h4>
+                        <p style="font-size: 12px; color: var(--accent); margin-top: 3px;">${statusText}</p>
                     </div>
                 `;
                 container.appendChild(contactDiv);
@@ -784,6 +928,12 @@ HTML_CONTENT = """
             document.getElementById("selectModeBtn").classList.remove("hidden");
             document.getElementById("quantumFeaturesBar").classList.remove("hidden");
             
+            if (email.includes("Brian") || explicitSavedContacts.includes(email)) {
+                document.getElementById("addContactHeaderBtn").classList.add("hidden");
+            } else {
+                document.getElementById("addContactHeaderBtn").classList.remove("hidden");
+            }
+
             if (email.includes("Brian")) {
                 document.getElementById("videoCallBtn").classList.add("hidden");
                 document.getElementById("audioCallBtn").classList.add("hidden");
@@ -936,8 +1086,8 @@ HTML_CONTENT = """
             const modalList = document.getElementById("modalContactsList");
             modalList.innerHTML = "";
 
-            const allContactSet = new Set([...onlineUsers, ...savedContacts]);
-            allContactSet.forEach(email => {
+            const fullContactSet = new Set([...onlineUsers, ...allContacts]);
+            fullContactSet.forEach(email => {
                 if (email === currentUser || email === "Brian 🧠 (AI Archive)") return;
                 modalList.innerHTML += `
                     <div class="modal-contact-item" onclick="forwardSelectedTo('${email}')">
@@ -983,8 +1133,8 @@ HTML_CONTENT = """
             if (!chatHistories[activeContact]) chatHistories[activeContact] = [];
             chatHistories[activeContact].push(msgObj);
             
-            if (!savedContacts.includes(activeContact) && activeContact !== "Brian 🧠 (AI Archive)") {
-                savedContacts.push(activeContact);
+            if (!allContacts.includes(activeContact) && activeContact !== "Brian 🧠 (AI Archive)") {
+                allContacts.push(activeContact);
             }
 
             if (ghostModeActive) {
