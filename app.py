@@ -3,65 +3,47 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import json
 import sqlite3
-import uuid
-from typing import Dict, List, Optional
+from fastapi import FastAPI, HTTPException
 
-app = FastAPI(title="Metaverse WhatsApp - Google OAuth Edition")
+app = FastAPI()
 
-# ==================== DATABASE SETUP ====================
-def init_db():
-    conn = sqlite3.connect("metaverse_whatsapp.db", check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            email TEXT PRIMARY KEY,
-            display_name TEXT,
-            status TEXT,
-            profile_pic TEXT,
-            theme TEXT
+@app.get("/api/contacts")
+async def get_contacts(current_user_email: str):
+    try:
+        conn = sqlite3.connect("chat.db")
+        cursor = conn.cursor()
+        
+        # Ensure table exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                email TEXT UNIQUE,
+                profile_pic TEXT,
+                status TEXT
+            )
+        """)
+        
+        # Retrieve all users excluding the currently signed-in user
+        cursor.execute(
+            "SELECT id, name, email, profile_pic, status FROM users WHERE email != ?", 
+            (current_user_email,)
         )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender TEXT,
-            recipient TEXT,
-            type TEXT,
-            content TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            is_deleted INTEGER DEFAULT 0
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS saved_contacts (
-            username TEXT,
-            contact TEXT,
-            PRIMARY KEY (username, contact)
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS groups (
-            group_id TEXT PRIMARY KEY,
-            group_name TEXT,
-            admin TEXT,
-            members TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS group_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id TEXT,
-            sender TEXT,
-            type TEXT,
-            content TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            is_deleted INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    return conn
+        rows = cursor.fetchall()
+        conn.close()
 
-db_conn = init_db()
+        return [
+            {
+                "id": r[0], 
+                "name": r[1] or r[2].split('@')[0], 
+                "email": r[2], 
+                "avatar": r[3] or "https://api.dicebear.com/7.x/bottts/svg?seed=" + r[2], 
+                "status": r[4] or "Available"
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== WEBSOCKET CONNECTION MANAGER ====================
 class ConnectionManager:
@@ -303,7 +285,35 @@ async def websocket_endpoint(websocket: WebSocket, email: str):
     except WebSocketDisconnect:
         manager.disconnect(email)
         await manager.broadcast_user_list()
+async function fetchAndRenderContacts(userEmail) {
+    const contactContainer = document.getElementById('contacts-list');
+    if (!contactContainer) return;
 
+    try {
+        const response = await fetch(`/api/contacts?current_user_email=${encodeURIComponent(userEmail)}`);
+        const contacts = await response.json();
+
+        if (!contacts || contacts.length === 0) {
+            contactContainer.innerHTML = `
+                <div class="empty-state">
+                    <p>No contacts online yet.</p>
+                </div>`;
+            return;
+        }
+
+        contactContainer.innerHTML = contacts.map(contact => `
+            <div class="contact-card" onclick="openChat('${contact.email}', '${contact.name}')">
+                <img src="${contact.avatar}" alt="${contact.name}" class="contact-avatar" />
+                <div class="contact-details">
+                    <span class="contact-name">${contact.name}</span>
+                    <span class="contact-status">${contact.status}</span>
+                </div>
+            </div>
+        `).join('');
+    } catch (err) {
+        console.error("Error loading contacts:", err);
+    }
+}
 
 # ==================== FRONTEND UI ====================
 HTML_CONTENT = """
@@ -443,6 +453,32 @@ HTML_CONTENT = """
             #app-container.mobile-chat-open .sidebar { display: none; }
             #app-container.mobile-chat-open .chat-panel { display: flex; }
         }
+        #contacts-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: calc(100vh - 140px);
+    overflow-y: auto;
+    padding: 10px;
+}
+
+.contact-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    background: rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(12px);
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    cursor: pointer;
+    transition: all 0.2s ease-in-out;
+}
+
+.contact-card:hover {
+    background: rgba(255, 255, 255, 0.18);
+    transform: translateY(-2px);
+}
     </style>
 </head>
 <body class="theme-dark">
