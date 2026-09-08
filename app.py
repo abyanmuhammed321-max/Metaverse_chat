@@ -255,7 +255,7 @@ HTML_CONTENT = """
         /* Sidebar */
         .sidebar { width: 35%; background: var(--bg-panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; height: 100%; }
         .sidebar-header { padding: 16px 20px; background: var(--bg-secondary); display: flex; align-items: center; justify-content: space-between; height: 75px; border-bottom: 1px solid var(--border); }
-        .my-profile { font-weight: 600; color: var(--accent); font-size: 14px; display: flex; align-items: center; gap: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+        .my-profile { font-weight: 600; color: var(--accent); font-size: 14px; display: flex; align-items: center; gap: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
         
         .sidebar-toolbar { padding: 12px 18px; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
         .sidebar-toolbar input { flex: 1; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: white; font-size: 13px; outline: none; }
@@ -285,7 +285,8 @@ HTML_CONTENT = """
         .header-btn:hover { border-color: var(--accent); color: var(--accent); }
         .header-btn.active-mode { background: var(--accent); color: var(--bg-primary); font-weight: bold; border-color: var(--accent); }
         
-        .call-btn { background: var(--accent-gradient); color: var(--bg-primary); border: none; padding: 8px 14px; border-radius: 25px; cursor: pointer; font-weight: 700; font-size: 12px; box-shadow: 0 0 15px rgba(0, 242, 254, 0.2); white-space: nowrap; }
+        .call-btn { background: var(--bg-panel); color: var(--text-main); border: 1px solid var(--border); padding: 7px 12px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 12px; white-space: nowrap; transition: 0.2s; }
+        .call-btn:hover { border-color: var(--accent); color: var(--accent); }
         
         /* Quantum Features Bar */
         .quantum-features-bar { background: rgba(17, 24, 39, 0.9); padding: 8px 15px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); font-size: 11px; flex-wrap: wrap; gap: 6px; }
@@ -322,17 +323,25 @@ HTML_CONTENT = """
         .action-btn.recording { color: #ef4444; animation: pulse 1s infinite; }
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
 
-        /* Forward Modal */
-        #forward-modal { position: absolute; inset: 0; background: rgba(0,0,0,0.8); z-index: 300; display: flex; justify-content: center; align-items: center; backdrop-filter: blur(5px); padding: 20px; }
-        .modal-content { background: var(--bg-panel); border: 1px solid var(--border); padding: 25px; border-radius: 16px; width: 100%; max-width: 380px; box-shadow: 0 15px 35px rgba(0,0,0,0.6); }
+        /* Modals (Settings & Forward) */
+        .modal-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.8); z-index: 300; display: flex; justify-content: center; align-items: center; backdrop-filter: blur(5px); padding: 20px; }
+        .modal-content { background: var(--bg-panel); border: 1px solid var(--border); padding: 25px; border-radius: 16px; width: 100%; max-width: 400px; box-shadow: 0 15px 35px rgba(0,0,0,0.6); }
         .modal-content h3 { color: var(--accent); margin-bottom: 16px; font-size: 18px; }
+        .modal-content label { font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px; margin-top: 12px; }
+        .modal-content input, .modal-content textarea { width: 100%; padding: 10px 14px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; color: white; font-size: 13px; outline: none; }
+        .modal-content input:focus, .modal-content textarea:focus { border-color: var(--accent); }
         .modal-contact-item { padding: 12px 16px; background: var(--bg-secondary); margin-bottom: 10px; border-radius: 8px; cursor: pointer; border: 1px solid var(--border); transition: 0.2s; font-size: 14px; }
         .modal-contact-item:hover { border-color: var(--accent); }
 
-        /* Video Call Overlay */
+        /* Video / Audio Call Overlay */
         #call-overlay { position: absolute; inset: 0; background: rgba(8, 12, 20, 0.96); z-index: 400; display: flex; flex-direction: column; align-items: center; justify-content: center; backdrop-filter: blur(10px); padding: 20px; }
         .video-grid { display: flex; gap: 20px; margin-bottom: 25px; flex-wrap: wrap; justify-content: center; }
         video { width: 450px; max-width: 90vw; height: 320px; background: black; border: 1px solid var(--border); border-radius: 16px; object-fit: cover; box-shadow: 0 0 30px rgba(0,0,0,0.5); }
+        
+        .call-controls { display: flex; gap: 15px; align-items: center; margin-top: 10px; }
+        .call-control-btn { background: var(--bg-panel); border: 1px solid var(--border); color: white; width: 50px; height: 50px; border-radius: 50%; font-size: 20px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: 0.2s; box-shadow: 0 4px 10px rgba(0,0,0,0.4); }
+        .call-control-btn:hover { border-color: var(--accent); }
+        .call-control-btn.active-control { background: #ef4444; border-color: #ef4444; }
         .hangup-btn { background: #ef4444; color: white; border: none; padding: 12px 28px; border-radius: 30px; font-weight: bold; cursor: pointer; font-size: 15px; box-shadow: 0 0 15px rgba(239,68,68,0.4); }
 
         /* ==================== MOBILE RESPONSIVE MEDIA QUERY ==================== */
@@ -340,11 +349,9 @@ HTML_CONTENT = """
             body { align-items: flex-start; height: 100vh; height: 100dvh; }
             #app-container { width: 100%; height: 100vh; height: 100dvh; border-radius: 0; border: none; }
             
-            /* By default on mobile, show sidebar and hide chat */
             .sidebar { width: 100%; display: flex; }
             .chat-panel { width: 100%; display: none; }
             
-            /* When chat is open on mobile */
             #app-container.mobile-chat-open .sidebar { display: none; }
             #app-container.mobile-chat-open .chat-panel { display: flex; }
             
@@ -367,7 +374,6 @@ HTML_CONTENT = """
                 <h1>⚡ Metaverse</h1>
                 <p>Google Quantum Encrypted Node</p>
                 
-                <!-- Google Sign In Button Container -->
                 <div class="google-btn-wrapper">
                     <div id="g_id_onload"
                          data-client_id="358332042325-3s7o118sjfv1qug4r6qlmf534083ti10.apps.googleusercontent.com"
@@ -394,8 +400,11 @@ HTML_CONTENT = """
         <!-- Sidebar -->
         <div class="sidebar">
             <div class="sidebar-header">
-                <div class="my-profile" id="my-profile-name" title="Node: Offline">⚡ Node: Offline</div>
-                <button class="header-btn" onclick="logout()" title="Logout" style="font-size: 11px; padding: 5px 10px;">Logout</button>
+                <div class="my-profile" id="my-profile-display" title="Node">⚡ Node</div>
+                <div style="display: flex; gap: 6px;">
+                    <button class="header-btn" onclick="openSettingsModal()" title="Settings">⚙️</button>
+                    <button class="header-btn" onclick="logout()" title="Logout" style="font-size: 11px; padding: 5px 8px;">Logout</button>
+                </div>
             </div>
             <div class="sidebar-toolbar">
                 <input type="text" id="searchContactInput" placeholder="Search contacts..." oninput="filterContacts()">
@@ -421,7 +430,8 @@ HTML_CONTENT = """
                 </div>
                 <div class="header-actions">
                     <button class="header-btn hidden" id="selectModeBtn" onclick="toggleSelectMode()">Select</button>
-                    <button class="call-btn hidden" id="videoCallBtn" onclick="startCall()">🔮 Video Call</button>
+                    <button class="call-btn hidden" id="audioCallBtn" onclick="startCall(false)">📞 Voice Call</button>
+                    <button class="call-btn hidden" id="videoCallBtn" onclick="startCall(true)">🔮 Video Call</button>
                 </div>
             </div>
 
@@ -462,8 +472,32 @@ HTML_CONTENT = """
             </div>
         </div>
 
+        <!-- Settings Modal -->
+        <div id="settings-modal" class="modal-overlay hidden">
+            <div class="modal-content">
+                <h3>⚙️ WhatsApp & Profile Settings</h3>
+                <label>Display Name</label>
+                <input type="text" id="settingsNameInput" placeholder="Your name...">
+                
+                <label>About / Status</label>
+                <textarea id="settingsStatusInput" rows="2" placeholder="Hey there! I am using Metaverse WhatsApp..."></textarea>
+                
+                <label>Theme Color</label>
+                <div style="display: flex; gap: 10px; margin-top: 6px; margin-bottom: 20px;">
+                    <button class="sel-btn" onclick="setTheme('cyan')" style="background: #00f2fe; color: black; flex: 1;">Cyan</button>
+                    <button class="sel-btn" onclick="setTheme('emerald')" style="background: #10b981; color: white; flex: 1;">Emerald</button>
+                    <button class="sel-btn" onclick="setTheme('violet')" style="background: #8b5cf6; color: white; flex: 1;">Violet</button>
+                </div>
+
+                <div style="display: flex; gap: 10px;">
+                    <button class="sel-btn" style="flex: 1; background: var(--accent-gradient); color: black;" onclick="saveSettings()">Save Settings</button>
+                    <button class="sel-btn" style="flex: 1; background: var(--bg-secondary);" onclick="closeSettingsModal()">Cancel</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Forward Modal -->
-        <div id="forward-modal" class="hidden">
+        <div id="forward-modal" class="modal-overlay hidden">
             <div class="modal-content">
                 <h3>Forward to Node...</h3>
                 <div id="modalContactsList" style="max-height: 220px; overflow-y: auto; margin-bottom: 16px;"></div>
@@ -471,25 +505,31 @@ HTML_CONTENT = """
             </div>
         </div>
 
-        <!-- Video Call Overlay -->
+        <!-- Video & Audio Call Overlay -->
         <div id="call-overlay" class="hidden">
             <div class="video-grid">
                 <div>
-                    <p style="color: var(--accent); margin-bottom: 8px; text-align: center; font-weight: 600; font-size: 13px;">Local Stream</p>
+                    <p style="color: var(--accent); margin-bottom: 8px; text-align: center; font-weight: 600; font-size: 13px;" id="localVideoLabel">Local Stream</p>
                     <video id="localVideo" autoplay muted></video>
                 </div>
                 <div>
-                    <p style="color: var(--accent); margin-bottom: 8px; text-align: center; font-weight: 600; font-size: 13px;">Remote Quantum Stream</p>
+                    <p style="color: var(--accent); margin-bottom: 8px; text-align: center; font-weight: 600; font-size: 13px;" id="remoteVideoLabel">Remote Quantum Stream</p>
                     <video id="remoteVideo" autoplay></video>
                 </div>
             </div>
-            <button class="hangup-btn" onclick="endCall()">End Secure Call</button>
+            
+            <div class="call-controls">
+                <button class="call-control-btn" id="muteMicBtn" onclick="toggleMuteMic()" title="Mute/Unmute Mic">🎤</button>
+                <button class="call-control-btn" id="toggleCamBtn" onclick="toggleCamera()" title="Camera On/Off">📷</button>
+                <button class="hangup-btn" onclick="endCall()">End Secure Call</button>
+            </div>
         </div>
     </div>
 
     <script>
         let ws;
         let currentUser = localStorage.getItem("metaverse_user") || null;
+        let userStatus = localStorage.getItem("metaverse_status") || "Hey there! I am using Metaverse WhatsApp";
         let onlineUsers = [];
         let savedContacts = [];
         let activeContact = null;
@@ -502,6 +542,7 @@ HTML_CONTENT = """
 
         let mediaRecorder, audioChunks = [], isRecording = false;
         let localStream, peerConnection;
+        let isMicMuted = false, isCameraOff = false;
         const servers = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
         window.onload = function() {
@@ -552,8 +593,8 @@ HTML_CONTENT = """
             currentUser = username;
             localStorage.setItem("metaverse_user", currentUser);
 
-            document.getElementById("my-profile-name").innerText = `⚡ Node: ${currentUser}`;
-            document.getElementById("my-profile-name").title = `Node: ${currentUser}`;
+            document.getElementById("my-profile-display").innerText = `⚡ ${currentUser}`;
+            document.getElementById("my-profile-display").title = userStatus;
             document.getElementById("login-screen").classList.add("hidden");
             connectWebSocket();
             fetchSavedContacts();
@@ -567,6 +608,33 @@ HTML_CONTENT = """
         function setTheme(themeName, save = true) {
             document.body.className = `theme-${themeName}`;
             if (save) localStorage.setItem("metaverse_theme", themeName);
+        }
+
+        function openSettingsModal() {
+            document.getElementById("settingsNameInput").value = currentUser;
+            document.getElementById("settingsStatusInput").value = userStatus;
+            document.getElementById("settings-modal").classList.remove("hidden");
+        }
+
+        function closeSettingsModal() {
+            document.getElementById("settings-modal").classList.add("hidden");
+        }
+
+        function saveSettings() {
+            const newName = document.getElementById("settingsNameInput").value.trim();
+            const newStatus = document.getElementById("settingsStatusInput").value.trim();
+            if (newName) {
+                currentUser = newName;
+                localStorage.setItem("metaverse_user", currentUser);
+            }
+            if (newStatus) {
+                userStatus = newStatus;
+                localStorage.setItem("metaverse_status", userStatus);
+            }
+            document.getElementById("my-profile-display").innerText = `⚡ ${currentUser}`;
+            document.getElementById("my-profile-display").title = userStatus;
+            closeSettingsModal();
+            alert("Settings updated successfully!");
         }
 
         function toggleGhostMode() {
@@ -680,7 +748,7 @@ HTML_CONTENT = """
 
                 const initial = email === "Brian 🧠 (AI Archive)" ? "🧠" : email.charAt(0).toUpperCase();
                 const dotClass = isOnline ? "online-dot" : "offline-dot";
-                const statusText = email === "Brian 🧠 (AI Archive)" ? "AI Memory Vault" : (isOnline ? "Online Node" : "Offline");
+                const statusText = email === "Brian 🧠 (AI Archive)" ? "AI Memory Vault" : (isOnline ? "Online" : "Offline");
 
                 contactDiv.innerHTML = `
                     <div class="contact-avatar">
@@ -718,11 +786,12 @@ HTML_CONTENT = """
             
             if (email.includes("Brian")) {
                 document.getElementById("videoCallBtn").classList.add("hidden");
+                document.getElementById("audioCallBtn").classList.add("hidden");
             } else {
                 document.getElementById("videoCallBtn").classList.remove("hidden");
+                document.getElementById("audioCallBtn").classList.remove("hidden");
             }
 
-            // Mobile view adjustment: slide to chat panel
             document.getElementById("app-container").classList.add("mobile-chat-open");
             
             try {
@@ -998,33 +1067,64 @@ HTML_CONTENT = """
             }
         }
 
-        async function startCall() {
+        async function startCall(withVideo = true) {
             if (!activeContact || activeContact.includes("Brian")) return;
             document.getElementById("call-overlay").classList.remove("hidden");
 
-            localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-            document.getElementById("localVideo").srcObject = localStream;
+            isMicMuted = false;
+            isCameraOff = !withVideo;
+            document.getElementById("muteMicBtn").classList.remove("active-control");
+            document.getElementById("toggleCamBtn").classList.toggle("active-control", !withVideo);
 
-            peerConnection = new RTCPeerConnection(servers);
-            localStream.getTracks().forEach(t => peerConnection.addTrack(t, localStream));
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: withVideo, audio: true });
+                document.getElementById("localVideo").srcObject = localStream;
+                document.getElementById("localVideo").style.display = withVideo ? "block" : "none";
 
-            peerConnection.ontrack = e => { document.getElementById("remoteVideo").srcObject = e.streams[0]; };
-            peerConnection.onicecandidate = e => { if (e.candidate) ws.send(JSON.stringify({ type: "signal", recipient_id: activeContact, signal: { candidate: e.candidate } })); };
+                peerConnection = new RTCPeerConnection(servers);
+                localStream.getTracks().forEach(t => peerConnection.addTrack(t, localStream));
 
-            const offer = await peerConnection.createOffer();
-            await peerConnection.setLocalDescription(offer);
-            ws.send(JSON.stringify({ type: "signal", recipient_id: activeContact, signal: { sdp: peerConnection.localDescription } }));
+                peerConnection.ontrack = e => { document.getElementById("remoteVideo").srcObject = e.streams[0]; };
+                peerConnection.onicecandidate = e => { if (e.candidate) ws.send(JSON.stringify({ type: "signal", recipient_id: activeContact, signal: { candidate: e.candidate } })); };
+
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                ws.send(JSON.stringify({ type: "signal", recipient_id: activeContact, signal: { sdp: peerConnection.localDescription } }));
+            } catch (err) {
+                console.error("Call initialization failed", err);
+                alert("Could not access camera/microphone.");
+                endCall();
+            }
+        }
+
+        function toggleMuteMic() {
+            if (!localStream) return;
+            isMicMuted = !isMicMuted;
+            localStream.getAudioTracks().forEach(track => { track.enabled = !isMicMuted; });
+            document.getElementById("muteMicBtn").classList.toggle("active-control", isMicMuted);
+        }
+
+        function toggleCamera() {
+            if (!localStream) return;
+            isCameraOff = !isCameraOff;
+            localStream.getVideoTracks().forEach(track => { track.enabled = !isCameraOff; });
+            document.getElementById("localVideo").style.display = isCameraOff ? "none" : "block";
+            document.getElementById("toggleCamBtn").classList.toggle("active-control", isCameraOff);
         }
 
         async function handleSignal(senderId, signal) {
             if (!peerConnection) {
                 document.getElementById("call-overlay").classList.remove("hidden");
-                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                document.getElementById("localVideo").srcObject = localStream;
-                peerConnection = new RTCPeerConnection(servers);
-                localStream.getTracks().forEach(t => peerConnection.addTrack(t, localStream));
-                peerConnection.ontrack = e => { document.getElementById("remoteVideo").srcObject = e.streams[0]; };
-                peerConnection.onicecandidate = e => { if (e.candidate) ws.send(JSON.stringify({ type: "signal", recipient_id: senderId, signal: { candidate: e.candidate } })); };
+                try {
+                    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    document.getElementById("localVideo").srcObject = localStream;
+                    peerConnection = new RTCPeerConnection(servers);
+                    localStream.getTracks().forEach(t => peerConnection.addTrack(t, localStream));
+                    peerConnection.ontrack = e => { document.getElementById("remoteVideo").srcObject = e.streams[0]; };
+                    peerConnection.onicecandidate = e => { if (e.candidate) ws.send(JSON.stringify({ type: "signal", recipient_id: senderId, signal: { candidate: e.candidate } })); };
+                } catch {
+                    return;
+                }
             }
 
             if (signal.sdp) {
@@ -1043,6 +1143,7 @@ HTML_CONTENT = """
             if (peerConnection) peerConnection.close();
             if (localStream) localStream.getTracks().forEach(t => t.stop());
             peerConnection = null;
+            localStream = null;
             document.getElementById("call-overlay").classList.add("hidden");
         }
     </script>
